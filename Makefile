@@ -7,7 +7,7 @@ REPO=$(AWS_ACCOUNT_ID).dkr.ecr.${AWS_REGION}.amazonaws.com/aws/amazon-vpc-resour
 KO_DOCKER_REPO ?= ${REPO} # Used for development images
 
 GIT_VERSION=$(shell git describe --tags --always)
-MAKEFILE_PATH = $(dir $(realpath -s $(firstword $(MAKEFILE_LIST))))
+MAKEFILE_PATH = /home/sichaow/workspace/amazon-vpc-resource-controller-k8s
 
 VERSION ?= $(GIT_VERSION)
 IMAGE ?= $(REPO):$(VERSION)
@@ -108,9 +108,9 @@ __check_var = \
       $(error Undefined variable $1$(if $2, ($2))))
 
 build-test-binaries:
-	mkdir -p ${MAKEFILE_PATH}build
+	mkdir -p ${MAKEFILE_PATH}/build
 	find ${MAKEFILE_PATH} -name '*suite_test.go' -type f  | xargs dirname  | xargs ginkgo build
-	find ${MAKEFILE_PATH} -name "*.test" -print0 | xargs -0 -I {} mv {} ${MAKEFILE_PATH}build
+	find ${MAKEFILE_PATH} -name "*.test" -print0 | xargs -0 -I {} mv {} ${MAKEFILE_PATH}/build
 
 apply-dependencies:
 	bash ${MAKEFILE_PATH}/scripts/test/install-cert-manager.sh
