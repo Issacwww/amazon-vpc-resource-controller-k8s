@@ -54,23 +54,23 @@ var stageDurationBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 
 var (
 	prometheusRegistered = false
 
-	// nodeManagerAsyncQueueWait measures the time a node async job waits between
+	// nodeAsyncWorkerQueueWait measures the time a node async job waits between
 	// being submitted (SubmitJob) and being picked up by a worker goroutine. High
 	// wait + low operation duration => the worker pool is the bottleneck.
-	nodeManagerAsyncQueueWait = prometheus.NewHistogramVec(
+	nodeAsyncWorkerQueueWait = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "node_manager_async_queue_wait_seconds",
+			Name:    "node_async_worker_queue_wait_seconds",
 			Help:    "Time a node async job waits in the worker queue before execution",
 			Buckets: stageDurationBuckets,
 		},
 		[]string{"operation"},
 	)
 
-	// nodeManagerAsyncOperationDuration measures how long the worker spends
+	// nodeAsyncWorkerOperationDuration measures how long the worker spends
 	// actually running the job (InitResources / UpdateResources / DeleteResources).
-	nodeManagerAsyncOperationDuration = prometheus.NewHistogramVec(
+	nodeAsyncWorkerOperationDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "node_manager_async_operation_duration_seconds",
+			Name:    "node_async_worker_operation_duration_seconds",
 			Help:    "Time a node async operation takes to execute in the worker",
 			Buckets: stageDurationBuckets,
 		},
@@ -81,8 +81,8 @@ var (
 func prometheusRegister() {
 	if !prometheusRegistered {
 		metrics.Registry.MustRegister(
-			nodeManagerAsyncQueueWait,
-			nodeManagerAsyncOperationDuration,
+			nodeAsyncWorkerQueueWait,
+			nodeAsyncWorkerOperationDuration,
 		)
 		prometheusRegistered = true
 	}
@@ -267,6 +267,16 @@ func (m *manager) AddNode(nodeName string) error {
 			GetNodeOS(k8sNode))
 		logVerbosity = 1
 		addedMsg = "node added as an un-managed node"
+	}
+
+	// Defense-in-depth against a node deleted while this lock-free AddNode is in
+	// flight. The node controller already serializes Add/Delete per node key, so
+	// this is belt-and-suspenders for any future caller that drives AddNode off a
+	// different controller. Cheap informer-cache read (no API call), done outside
+	// the lock so it doesn't widen the critical section.
+	if _, err := m.wrapper.K8sAPI.GetNode(k8sNode.Name); err != nil {
+		log.Info("node no longer exists in cache before publishing, skipping add", "error", err.Error())
+		return nil
 	}
 
 	// Critical section: in-memory dataStore mutation + job submission only. The
@@ -556,7 +566,7 @@ func (m *manager) performAsyncOperation(job interface{}) (ctrl.Result, error) {
 	// re-queued.
 	if !asyncJob.enqueueTime.IsZero() {
 		queueWait := time.Since(asyncJob.enqueueTime)
-		nodeManagerAsyncQueueWait.WithLabelValues(string(asyncJob.op)).Observe(queueWait.Seconds())
+		nodeAsyncWorkerQueueWait.WithLabelValues(string(asyncJob.op)).Observe(queueWait.Seconds())
 		if queueWait > slowStageThreshold {
 			log.Info("slow path: async job waited in queue", "stage", "queue_wait", "duration", queueWait.String())
 		}
@@ -569,7 +579,7 @@ func (m *manager) performAsyncOperation(job interface{}) (ctrl.Result, error) {
 		initStart := time.Now()
 		err = asyncJob.node.InitResources(m.resourceManager)
 		initDuration := time.Since(initStart)
-		nodeManagerAsyncOperationDuration.WithLabelValues(string(Init)).Observe(initDuration.Seconds())
+		nodeAsyncWorkerOperationDuration.WithLabelValues(string(Init)).Observe(initDuration.Seconds())
 		if initDuration > slowStageThreshold {
 			log.Info("slow path: async operation", "stage", "Init", "duration", initDuration.String())
 		}
@@ -597,7 +607,7 @@ func (m *manager) performAsyncOperation(job interface{}) (ctrl.Result, error) {
 		updateStart := time.Now()
 		err = asyncJob.node.UpdateResources(m.resourceManager)
 		updateDuration := time.Since(updateStart)
-		nodeManagerAsyncOperationDuration.WithLabelValues(string(Update)).Observe(updateDuration.Seconds())
+		nodeAsyncWorkerOperationDuration.WithLabelValues(string(Update)).Observe(updateDuration.Seconds())
 		if updateDuration > slowStageThreshold {
 			log.Info("slow path: async operation", "stage", "Update", "duration", updateDuration.String())
 		}
@@ -605,7 +615,7 @@ func (m *manager) performAsyncOperation(job interface{}) (ctrl.Result, error) {
 		deleteStart := time.Now()
 		err = asyncJob.node.DeleteResources(m.resourceManager)
 		deleteDuration := time.Since(deleteStart)
-		nodeManagerAsyncOperationDuration.WithLabelValues(string(Delete)).Observe(deleteDuration.Seconds())
+		nodeAsyncWorkerOperationDuration.WithLabelValues(string(Delete)).Observe(deleteDuration.Seconds())
 		if deleteDuration > slowStageThreshold {
 			log.Info("slow path: async operation", "stage", "Delete", "duration", deleteDuration.String())
 		}
