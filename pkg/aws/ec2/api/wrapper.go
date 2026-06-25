@@ -87,6 +87,13 @@ var (
 		},
 	)
 
+	ec2APIThrottleErrCnt = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ec2_api_throttle_count",
+			Help: "The number of EC2 API responses that were throttled (e.g. RequestLimitExceeded)",
+		},
+	)
+
 	ec2DescribeInstancesAPICnt = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Name: "ec2_describe_instances_api_req_count",
@@ -382,6 +389,7 @@ func prometheusRegister() {
 		metrics.Registry.MustRegister(
 			ec2APICallCnt,
 			ec2APIErrCnt,
+			ec2APIThrottleErrCnt,
 			ec2DescribeInstancesAPICnt,
 			ec2DescribeInstancesAPIErrCnt,
 			ec2CreateNetworkInterfaceAPICallCnt,
@@ -482,10 +490,53 @@ func NewEC2Wrapper(roleARN, clusterName, region string, instanceClientQPS, insta
 	return ec2Wrapper, nil
 }
 
+// throttleErrorCodes are the EC2/STS error codes that indicate API throttling.
+var throttleErrorCodes = map[string]struct{}{
+	"RequestLimitExceeded":        {},
+	"Throttling":                  {},
+	"ThrottlingException":         {},
+	"RequestThrottled":            {},
+	"RequestThrottledException":   {},
+	"TooManyRequestsException":    {},
+	"Client.RequestLimitExceeded": {},
+}
+
+// isThrottleError reports whether err is an AWS throttling error.
+func isThrottleError(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		_, ok := throttleErrorCodes[apiErr.ErrorCode()]
+		return ok
+	}
+	return false
+}
+
+// throttleMetricMiddleware is an observer-only Deserialize middleware that counts
+// throttled EC2 API responses. It never modifies the request or response; it only
+// reads the per-attempt error and increments ec2_api_throttle_count. Counting in
+// the Deserialize step captures every throttled attempt, including retried ones.
+func throttleMetricMiddleware(stack *smithymiddleware.Stack) error {
+	return stack.Deserialize.Add(
+		smithymiddleware.DeserializeMiddlewareFunc(
+			"vpcrcEC2ThrottleMetric",
+			func(ctx context.Context, in smithymiddleware.DeserializeInput, next smithymiddleware.DeserializeHandler) (
+				out smithymiddleware.DeserializeOutput, metadata smithymiddleware.Metadata, err error) {
+				out, metadata, err = next.HandleDeserialize(ctx, in)
+				if err != nil && isThrottleError(err) {
+					ec2APIThrottleErrCnt.Inc()
+				}
+				return out, metadata, err
+			},
+		),
+		smithymiddleware.After,
+	)
+}
+
 func (e *ec2Wrapper) getInstanceConfig() (*aws.Config, error) {
 	// Create a new config
 	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithAPIOptions([]func(stack *smithymiddleware.Stack) error{
 		awsmiddleware.AddUserAgentKeyValue(AppName, version.GitVersion),
+		throttleMetricMiddleware,
 	}))
 	if err != nil {
 		return &cfg, fmt.Errorf("failed to load AWS config: %w", err)

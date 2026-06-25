@@ -31,16 +31,62 @@ import (
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils"
 	asyncWorker "github.com/aws/amazon-vpc-resource-controller-k8s/pkg/worker"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/samber/lo"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/go-logr/logr"
 	v1 "k8s.io/api/core/v1"
 )
+
+// slowStageThreshold is the duration above which a single async operation is
+// logged on the slow path. Kept high so the happy path stays quiet.
+const slowStageThreshold = 10 * time.Second
+
+// stageDurationBuckets covers µs map writes up to multi-minute EC2-bound init.
+var stageDurationBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600}
+
+var (
+	prometheusRegistered = false
+
+	// nodeManagerAsyncQueueWait measures the time a node async job waits between
+	// being submitted (SubmitJob) and being picked up by a worker goroutine. High
+	// wait + low operation duration => the worker pool is the bottleneck.
+	nodeManagerAsyncQueueWait = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "node_manager_async_queue_wait_seconds",
+			Help:    "Time a node async job waits in the worker queue before execution",
+			Buckets: stageDurationBuckets,
+		},
+		[]string{"operation"},
+	)
+
+	// nodeManagerAsyncOperationDuration measures how long the worker spends
+	// actually running the job (InitResources / UpdateResources / DeleteResources).
+	nodeManagerAsyncOperationDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "node_manager_async_operation_duration_seconds",
+			Help:    "Time a node async operation takes to execute in the worker",
+			Buckets: stageDurationBuckets,
+		},
+		[]string{"operation"},
+	)
+)
+
+func prometheusRegister() {
+	if !prometheusRegistered {
+		metrics.Registry.MustRegister(
+			nodeManagerAsyncQueueWait,
+			nodeManagerAsyncOperationDuration,
+		)
+		prometheusRegistered = true
+	}
+}
 
 type manager struct {
 	// Log is the logger for node manager
@@ -97,6 +143,10 @@ type AsyncOperationJob struct {
 	op       AsyncOperation
 	node     node.Node
 	nodeName string
+	// enqueueTime is when the job was submitted to the worker queue; used to
+	// measure async queue wait. Zero means "do not record wait" (e.g. the
+	// internal Init->Update hand-off which never actually queued).
+	enqueueTime time.Time
 }
 
 const pausingHealthCheckDuration = 10 * time.Minute
@@ -115,6 +165,8 @@ func NewNodeManager(logger logr.Logger, resourceManager resource.ResourceManager
 		controllerVersion: controllerVersion,
 		clusterName:       clusterName,
 	}
+
+	prometheusRegister()
 
 	// add health check on subpath for node manager
 	healthzHandler.AddControllersHealthCheckers(
@@ -234,18 +286,28 @@ func (m *manager) AddNode(nodeName string) error {
 // submitting an Init job when submit is true. It returns false (changing nothing)
 // if the node was already added by a concurrent AddNode - first writer wins.
 func (m *manager) storeNodeIfAbsent(nodeName string, newNode node.Node, submit bool) bool {
+	// Critical section is kept as tiny as possible: the found-check + the map
+	// write ONLY. No K8s calls and no job submission happen under the lock — that
+	// is the whole point of the inflow fix, so that many reconciler goroutines can
+	// publish in parallel.
 	m.lock.Lock()
-	defer m.lock.Unlock()
-
 	if _, found := m.dataStore[nodeName]; found {
+		m.lock.Unlock()
 		return false
 	}
 	m.dataStore[nodeName] = newNode
+	m.lock.Unlock()
+
+	// SubmitJob is intentionally OUTSIDE the lock: only the winner (the goroutine
+	// that set the entry) reaches here - the losers returned false above - so the
+	// single-job-per-node guarantee still holds, and the workqueue Add never runs
+	// under the manager lock.
 	if submit {
 		m.worker.SubmitJob(AsyncOperationJob{
-			op:       Init,
-			node:     newNode,
-			nodeName: nodeName,
+			op:          Init,
+			node:        newNode,
+			nodeName:    nodeName,
+			enqueueTime: time.Now(),
 		})
 	}
 	return true
@@ -350,19 +412,24 @@ func (m *manager) UpdateNode(nodeName string) error {
 // may be nil to leave the datastore entry untouched (e.g. StillManaged).
 func (m *manager) applyNodeUpdateIfCurrent(nodeName string, expected, nodeToStore, nodeForJob node.Node, op AsyncOperation) bool {
 	m.lock.Lock()
-	defer m.lock.Unlock()
 
 	current, ok := m.dataStore[nodeName]
 	if !ok || current != expected {
+		m.lock.Unlock()
 		return false
 	}
 	if nodeToStore != nil {
 		m.dataStore[nodeName] = nodeToStore
 	}
+	m.lock.Unlock()
+
+	// SubmitJob OUTSIDE the lock (only the CAS winner reaches here), keeping the
+	// critical section to the in-memory map check + write.
 	m.worker.SubmitJob(AsyncOperationJob{
-		op:       op,
-		node:     nodeForJob,
-		nodeName: nodeName,
+		op:          op,
+		node:        nodeForJob,
+		nodeName:    nodeName,
+		enqueueTime: time.Now(),
 	})
 	return true
 }
@@ -406,9 +473,10 @@ func (m *manager) DeleteNode(nodeName string) error {
 	}
 
 	m.worker.SubmitJob(AsyncOperationJob{
-		op:       Delete,
-		node:     cachedNode,
-		nodeName: nodeName,
+		op:          Delete,
+		node:        cachedNode,
+		nodeName:    nodeName,
+		enqueueTime: time.Now(),
 	})
 
 	log.Info("node removed from data store")
@@ -483,11 +551,28 @@ func (m *manager) performAsyncOperation(job interface{}) (ctrl.Result, error) {
 
 	log := m.Log.WithValues("node", asyncJob.nodeName, "operation", asyncJob.op)
 
+	// Record async queue wait (enqueue -> pickup). Skipped for the internal
+	// Init->Update hand-off below, which sets enqueueTime to zero since it never
+	// re-queued.
+	if !asyncJob.enqueueTime.IsZero() {
+		queueWait := time.Since(asyncJob.enqueueTime)
+		nodeManagerAsyncQueueWait.WithLabelValues(string(asyncJob.op)).Observe(queueWait.Seconds())
+		if queueWait > slowStageThreshold {
+			log.Info("slow path: async job waited in queue", "stage", "queue_wait", "duration", queueWait.String())
+		}
+	}
+
 	var err error
 	switch asyncJob.op {
 	case Init:
 		utils.SendNodeEventWithNodeName(m.wrapper.K8sAPI, asyncJob.nodeName, utils.VersionNotice, fmt.Sprintf("The node is managed by VPC resource controller version %s", m.controllerVersion), v1.EventTypeNormal, m.Log)
+		initStart := time.Now()
 		err = asyncJob.node.InitResources(m.resourceManager)
+		initDuration := time.Since(initStart)
+		nodeManagerAsyncOperationDuration.WithLabelValues(string(Init)).Observe(initDuration.Seconds())
+		if initDuration > slowStageThreshold {
+			log.Info("slow path: async operation", "stage", "Init", "duration", initDuration.String())
+		}
 		if err != nil {
 			if pauseHealthCheckOnError(err) && !m.SkipHealthCheck() {
 				m.setStopHealthCheck()
@@ -502,13 +587,28 @@ func (m *manager) performAsyncOperation(job interface{}) (ctrl.Result, error) {
 			return ctrl.Result{}, nil
 		}
 
-		// If there's no error, we need to update the node so the capacity is advertised
+		// If there's no error, we need to update the node so the capacity is advertised.
+		// This is an internal hand-off, not a fresh queue pickup, so clear enqueueTime
+		// to avoid double-counting the queue wait against the Update operation.
 		asyncJob.op = Update
+		asyncJob.enqueueTime = time.Time{}
 		return m.performAsyncOperation(asyncJob)
 	case Update:
+		updateStart := time.Now()
 		err = asyncJob.node.UpdateResources(m.resourceManager)
+		updateDuration := time.Since(updateStart)
+		nodeManagerAsyncOperationDuration.WithLabelValues(string(Update)).Observe(updateDuration.Seconds())
+		if updateDuration > slowStageThreshold {
+			log.Info("slow path: async operation", "stage", "Update", "duration", updateDuration.String())
+		}
 	case Delete:
+		deleteStart := time.Now()
 		err = asyncJob.node.DeleteResources(m.resourceManager)
+		deleteDuration := time.Since(deleteStart)
+		nodeManagerAsyncOperationDuration.WithLabelValues(string(Delete)).Observe(deleteDuration.Seconds())
+		if deleteDuration > slowStageThreshold {
+			log.Info("slow path: async operation", "stage", "Delete", "duration", deleteDuration.String())
+		}
 	default:
 		m.Log.V(1).Info("no operation operation requested",
 			"node", asyncJob.nodeName)

@@ -87,8 +87,23 @@ var (
 		[]string{"operation"},
 	)
 
+	// trunkInitStageDuration breaks InitTrunk into stages so we can pinpoint which
+	// EC2 call or local rebuild step dominates trunk initialization.
+	trunkInitStageDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "trunk_init_stage_duration_seconds",
+			Help:    "Duration of each stage of trunk InitTrunk",
+			Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600},
+		},
+		[]string{"stage"},
+	)
+
 	prometheusRegistered = false
 )
+
+// trunkSlowStageThreshold is the duration above which an InitTrunk stage is
+// logged on the slow path.
+const trunkSlowStageThreshold = 10 * time.Second
 
 type TrunkENI interface {
 	// InitTrunk initializes trunk interface
@@ -214,8 +229,19 @@ func PrometheusRegister() {
 		metrics.Registry.MustRegister(unreconciledTrunkENICount)
 		metrics.Registry.MustRegister(branchENIOperationsSuccessCount)
 		metrics.Registry.MustRegister(branchENIOperationsFailureCount)
+		metrics.Registry.MustRegister(trunkInitStageDuration)
 
 		prometheusRegistered = true
+	}
+}
+
+// observeTrunkInitStage records the duration of an InitTrunk stage and logs it on
+// the slow path when it exceeds the threshold.
+func (t *trunkENI) observeTrunkInitStage(stage string, start time.Time) {
+	d := time.Since(start)
+	trunkInitStageDuration.WithLabelValues(stage).Observe(d.Seconds())
+	if d > trunkSlowStageThreshold {
+		t.log.Info("slow path: InitTrunk stage", "stage", stage, "duration", d.String())
 	}
 }
 
@@ -225,7 +251,11 @@ func (t *trunkENI) InitTrunk(instance ec2.EC2Instance, podList []v1.Pod) error {
 	instanceID := t.instance.InstanceID()
 	log := t.log.WithValues("request", "initialize", "instance ID", instanceID)
 
+	defer t.observeTrunkInitStage("total", time.Now())
+
+	getNwStart := time.Now()
 	nwInterfaces, err := t.ec2ApiHelper.GetInstanceNetworkInterface(&instanceID)
+	t.observeTrunkInitStage("get_instance_network_interfaces", getNwStart)
 	if err != nil {
 		trunkENIOperationsErrCount.WithLabelValues("describe_instance_nw_interface").Inc()
 		return err
@@ -241,7 +271,10 @@ func (t *trunkENI) InitTrunk(instance ec2.EC2Instance, podList []v1.Pod) error {
 		}
 		if *nwInterface.InterfaceType == "trunk" {
 			// Check that the trunkENI is in attached state before adding to cache
-			if err = t.ec2ApiHelper.WaitForNetworkInterfaceStatusChange(nwInterface.NetworkInterfaceId, string(ec2types.AttachmentStatusAttached)); err == nil {
+			waitStart := time.Now()
+			err = t.ec2ApiHelper.WaitForNetworkInterfaceStatusChange(nwInterface.NetworkInterfaceId, string(ec2types.AttachmentStatusAttached))
+			t.observeTrunkInitStage("wait_trunk_attached", waitStart)
+			if err == nil {
 				t.trunkENIId = *nwInterface.NetworkInterfaceId
 			} else {
 				return fmt.Errorf("failed to verify network interface status attached for %v", *nwInterface.NetworkInterfaceId)
@@ -259,8 +292,10 @@ func (t *trunkENI) InitTrunk(instance ec2.EC2Instance, podList []v1.Pod) error {
 			return err
 		}
 		// Trunk ENI doesn't need to have security group timeout as applied on primary ENI or branch ENIs as it is not a endpoint used in connection
+		createStart := time.Now()
 		trunk, err := t.ec2ApiHelper.CreateAndAttachNetworkInterface(&instanceID, aws.String(t.instance.SubnetID()),
 			t.instance.CurrentInstanceSecurityGroups(), t.nodeIDTag, &freeIndex, &TrunkEniDescription, &InterfaceTypeTrunk, nil, nil)
+		t.observeTrunkInitStage("create_attach_trunk", createStart)
 		if err != nil {
 			trunkENIOperationsErrCount.WithLabelValues("create_trunk_eni").Inc()
 			return err
@@ -308,7 +343,9 @@ func (t *trunkENI) InitTrunk(instance ec2.EC2Instance, podList []v1.Pod) error {
 	}
 
 	// Get the list of branch ENIs
+	getBranchStart := time.Now()
 	branchInterfaces, err := t.ec2ApiHelper.GetBranchNetworkInterface(&t.trunkENIId, aws.String(t.instance.SubnetID()))
+	t.observeTrunkInitStage("get_branch_network_interfaces", getBranchStart)
 	if err != nil {
 		return err
 	}
@@ -320,6 +357,7 @@ func (t *trunkENI) InitTrunk(instance ec2.EC2Instance, podList []v1.Pod) error {
 	}
 
 	// From the list of pods on the given node, and the branch ENIs from EC2 API call rebuild the internal cache
+	rebuildStart := time.Now()
 	for _, pod := range podList {
 		pod := pod // Fix gosec G601, so we can use &node
 		eniListFromPod := t.getBranchInterfacesUsedByPod(&pod)
@@ -342,8 +380,10 @@ func (t *trunkENI) InitTrunk(instance ec2.EC2Instance, podList []v1.Pod) error {
 		}
 		t.uidToBranchENIMap[string(pod.UID)] = branchENIs
 	}
+	t.observeTrunkInitStage("rebuild_cache_from_pods", rebuildStart)
 
 	// Delete the branch ENI that don't belong to any pod.
+	enqueueOrphanStart := time.Now()
 	for _, branchInterface := range associatedBranchInterfaces {
 		t.log.Info("pushing eni to delete queue as no pod owns it", "eni",
 			*branchInterface.NetworkInterfaceId)
@@ -363,6 +403,7 @@ func (t *trunkENI) InitTrunk(instance ec2.EC2Instance, podList []v1.Pod) error {
 			deletionTimeStamp: time.Now(),
 		})
 	}
+	t.observeTrunkInitStage("enqueue_orphan_branch_enis", enqueueOrphanStart)
 
 	log.V(1).Info("successfully initialized trunk with all associated branch interfaces",
 		"trunk", t.trunkENIId, "branch interfaces", t.uidToBranchENIMap)
