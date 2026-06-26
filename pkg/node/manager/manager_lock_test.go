@@ -67,7 +67,10 @@ type benchK8s struct {
 }
 
 func (f *benchK8s) GetNode(nodeName string) (*v1.Node, error) {
-	time.Sleep(f.delay)
+	// GetNode is an in-memory informer-cache read in production (cacheClient.Get),
+	// so it carries no injected latency. AddNode calls it once outside the lock and
+	// storeNodeIfAbsent re-checks it under the lock; modelling it as cheap keeps the
+	// in-lock existence re-check from artificially re-serializing the benchmark.
 	return &v1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: nodeName,
@@ -81,6 +84,10 @@ func (f *benchK8s) GetNode(nodeName string) (*v1.Node, error) {
 }
 
 func (f *benchK8s) GetCNINode(types.NamespacedName) (*rcV1alpha1.CNINode, error) {
+	// GetCNINode stands in for the expensive work AddNode does before publishing
+	// (the cache read + management checks the OLD code held the manager lock for).
+	// The injected latency lives here so the before/after lock contrast is driven
+	// by work that is now outside the critical section.
 	time.Sleep(f.delay)
 	// Returning an existing (empty) CNINode models the leader-transition case
 	// where CNINodes already exist, so CreateCNINode is never called. We

@@ -102,8 +102,12 @@ func NewDefaultWorkerPool(resourceName string, workerCount int, maxRequeue int,
 		maxRetriesOnErr: maxRequeue,
 		maxWorkerCount:  workerCount,
 		Log:             logger,
-		queue:           workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
-		ctx:             ctx,
+		// Named queue so controller-runtime's workqueue metrics provider vends
+		// workqueue_{depth,adds_total,queue_duration_seconds,work_duration_seconds}
+		// for this pool (e.g. name="node async workers"). Previously this queue was
+		// unnamed and had no depth/latency visibility - the main Queue 2 blind spot.
+		queue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), resourceName),
+		ctx:   ctx,
 	}
 }
 

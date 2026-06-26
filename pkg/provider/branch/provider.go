@@ -79,6 +79,18 @@ var (
 		[]string{operationLabel, resourceCountLabel},
 	)
 
+	// branchProviderInitStageDuration breaks InitResource into stages so we can see
+	// which part of node hydration dominates (pod cache read, trunk init, cache add,
+	// delete-queue job submission, node event emission).
+	branchProviderInitStageDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "branch_provider_init_stage_duration_seconds",
+			Help:    "Duration of each stage of branch provider InitResource",
+			Buckets: stageDurationBuckets,
+		},
+		[]string{"stage"},
+	)
+
 	deleteQueueRequeueRequest = ctrl.Result{RequeueAfter: time.Second * 30, Requeue: true}
 
 	// NodeDeleteRequeueRequestDelay represents the time after which the resources belonging to a node will be cleaned
@@ -90,6 +102,13 @@ var (
 	ErrTrunkExistInCache = fmt.Errorf("trunk eni already exist in cache")
 	ErrTrunkNotInCache   = fmt.Errorf("trunk eni not present in cache")
 )
+
+// slowStageThreshold is the duration above which an InitResource stage is logged
+// on the slow path.
+const slowStageThreshold = 10 * time.Second
+
+// stageDurationBuckets covers sub-second cache ops up to multi-minute EC2-bound init.
+var stageDurationBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600}
 
 // branchENIProvider provides branch ENI to all nodes that support Trunk network interface
 type branchENIProvider struct {
@@ -130,9 +149,20 @@ func prometheusRegister() {
 	if !prometheusRegistered {
 		metrics.Registry.MustRegister(
 			branchProviderOperationsErrCount,
-			branchProviderOperationLatency)
+			branchProviderOperationLatency,
+			branchProviderInitStageDuration)
 
 		prometheusRegistered = true
+	}
+}
+
+// observeInitStage records the duration of an InitResource stage and logs it on
+// the slow path when it exceeds the threshold.
+func (b *branchENIProvider) observeInitStage(stage, nodeName string, start time.Time) {
+	d := time.Since(start)
+	branchProviderInitStageDuration.WithLabelValues(stage).Observe(d.Seconds())
+	if d > slowStageThreshold {
+		b.log.Info("slow path: InitResource stage", "nodeName", nodeName, "stage", stage, "duration", d.String())
 	}
 }
 
@@ -148,15 +178,21 @@ func (b *branchENIProvider) InitResource(instance ec2.EC2Instance) error {
 	log := b.log.WithValues("nodeName", nodeName)
 	trunkENI := trunk.NewTrunkENI(log, instance, b.apiWrapper.EC2API)
 
+	totalStart := time.Now()
+	defer b.observeInitStage("total", nodeName, totalStart)
+
 	// Initialize the Trunk ENI
 	start := time.Now()
 
+	podStart := time.Now()
 	podList, err := b.apiWrapper.PodAPI.GetRunningPodsOnNode(nodeName)
+	b.observeInitStage("get_running_pods_on_node", nodeName, podStart)
 	if err != nil {
 		log.Error(err, "failed to get list of pod on node")
 		return err
 	}
 
+	initTrunkStart := time.Now()
 	if err := trunkENI.InitTrunk(instance, podList); err != nil {
 		// If it's an AWS Error, get the exit code without the error message to avoid
 		// broadcasting multiple different messaged events
@@ -183,22 +219,29 @@ func (b *branchENIProvider) InitResource(instance ec2.EC2Instance) error {
 		branchProviderOperationsErrCount.WithLabelValues("init").Inc()
 		return fmt.Errorf("initializing trunk, %w", err)
 	}
+	b.observeInitStage("init_trunk", nodeName, initTrunkStart)
 	branchProviderOperationLatency.WithLabelValues(operationInitTrunk, "1").Observe(timeSinceSeconds(start))
 
 	// Add the Trunk ENI to cache if it does not already exist
+	addCacheStart := time.Now()
 	if err := b.addTrunkToCache(nodeName, trunkENI); err != nil && err != ErrTrunkExistInCache {
 		branchProviderOperationsErrCount.WithLabelValues("add_trunk_to_cache").Inc()
 		return err
 	}
+	b.observeInitStage("add_trunk_to_cache", nodeName, addCacheStart)
 
 	// TODO: For efficiency submit the process delete queue job only when the delete queue has items.
 	// Submit periodic jobs for the given node name
+	submitStart := time.Now()
 	b.SubmitAsyncJob(worker.NewOnDemandProcessDeleteQueueJob(nodeName))
+	b.observeInitStage("submit_delete_queue_jobs", nodeName, submitStart)
 
 	b.log.Info("initialized the resource provider successfully")
 
 	// send an event to notify user this node has trunk interface initialized
+	eventStart := time.Now()
 	utils.SendNodeEventWithNodeName(b.apiWrapper.K8sAPI, nodeName, utils.NodeTrunkInitiatedReason, "The node has trunk interface initialized successfully", v1.EventTypeNormal, b.log)
+	b.observeInitStage("send_node_event", nodeName, eventStart)
 
 	return nil
 }

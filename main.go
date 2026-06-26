@@ -19,6 +19,7 @@ import (
 	"net/http"
 	_ "net/http/pprof" // #nosec G108
 	"os"
+	goruntime "runtime"
 	"time"
 
 	crdv1alpha1 "github.com/aws/amazon-vpc-cni-k8s/pkg/apis/crd/v1alpha1"
@@ -219,6 +220,12 @@ func main() {
 
 	// Profiler disabled by default, to enable set the enableProfiling argument
 	if enableProfiling {
+		// Enable mutex + block profiling (both OFF by default) so that
+		// /debug/pprof/mutex and /debug/pprof/block actually contain data. This
+		// is what lets us see WHICH lock is contended (manager lock vs the worker
+		// queue vs the branch provider lock, etc.) instead of guessing.
+		goruntime.SetMutexProfileFraction(5)                       // sample ~1/5 mutex contention events
+		goruntime.SetBlockProfileRate(int(time.Millisecond.Nanoseconds())) // sample blocking >= ~1ms
 		// To use the profiler - https://golang.org/pkg/net/http/pprof/
 		go func() {
 			setupLog.Info("starting profiler", "error", http.ListenAndServe("localhost:6060", nil)) // #nosec G114
