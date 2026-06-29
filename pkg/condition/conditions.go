@@ -15,11 +15,11 @@ package condition
 
 import (
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/config"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/k8s"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils/lock"
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -30,7 +30,7 @@ type condition struct {
 	hasDataStoreSynced   bool
 	log                  logr.Logger
 	K8sAPI               k8s.K8sWrapper
-	lock                 sync.Mutex
+	lock                 lock.Mutex
 	windowsPDFeatureFlag bool
 }
 

@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -35,6 +34,7 @@ import (
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/provider/branch/cooldown"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/provider/branch/trunk"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils/lock"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/worker"
 	"github.com/aws/smithy-go"
 
@@ -96,7 +96,7 @@ type branchENIProvider struct {
 	// log is the logger initialized with branch eni provider value
 	log logr.Logger
 	// lock to prevent concurrent writes to the trunk eni map
-	lock sync.RWMutex
+	lock lock.RWMutex
 	// trunkENICache is the map of node name to the trunk ENI
 	trunkENICache map[string]trunk.TrunkENI
 	// workerPool is the worker pool and queue for submitting async job

@@ -15,13 +15,13 @@ package pool
 
 import (
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
 
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/config"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils/lock"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/worker"
 )
 
@@ -61,7 +61,7 @@ type pool struct {
 	// warmPoolConfig is the configuration for the given pool
 	warmPoolConfig *config.WarmPoolConfig
 	// lock to concurrently make modification to the poll resources
-	lock sync.RWMutex // following resources are guarded by the lock
+	lock lock.RWMutex // following resources are guarded by the lock
 	// usedResources is the key value pair of the owner id to the resource id
 	usedResources map[string]Resource
 	// warmResources is the map of group id to a list of free resources available to be allocated to the pods

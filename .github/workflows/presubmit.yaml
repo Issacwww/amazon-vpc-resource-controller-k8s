@@ -37,6 +37,21 @@ jobs:
           sudo tar -C /usr/local -xzf pluto_${number}_linux_amd64.tar.gz
       - run: |
           /usr/local/pluto detect-files -d .
+  deadlock_detection:
+    name: Deadlock detection
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-go@v6.1.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: "**/go.sum"
+      # Build with the "deadlock" tag so pkg/utils/lock swaps sync.Mutex/RWMutex
+      # for go-deadlock, then run the unit tests (incl. the manager concurrency
+      # stress test). go-deadlock fails the run on lock-order inversion / re-entry.
+      - run: go test -tags deadlock -race ./pkg/... ./controllers/... ./webhooks/...
+
   vuln_check:
     runs-on: ubuntu-latest
     timeout-minutes: 5

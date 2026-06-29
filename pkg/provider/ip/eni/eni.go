@@ -16,13 +16,13 @@ package eni
 import (
 	"fmt"
 	"strings"
-	"sync"
 
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/aws/ec2"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/aws/ec2/api"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/aws/vpc"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/config"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils/lock"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/go-logr/logr"
@@ -34,7 +34,7 @@ type eniManager struct {
 	// instance is the pointer to the instance details
 	instance ec2.EC2Instance
 	// lock to prevent multiple routines concurrently accessing the eni for same node
-	lock sync.Mutex // lock guards the following resources
+	lock lock.Mutex // lock guards the following resources
 	// attachedENIs is the list of ENIs attached to the instance
 	attachedENIs []*eni
 	// resourceToENIMap is the map from IPv4 address or prefix to the ENI that it belongs to

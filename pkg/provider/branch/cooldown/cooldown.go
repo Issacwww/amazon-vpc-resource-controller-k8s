@@ -16,11 +16,11 @@ package cooldown
 import (
 	"fmt"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/config"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/k8s"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils/lock"
 	"github.com/go-logr/logr"
 )
 
@@ -28,7 +28,7 @@ import (
 var coolDown *cooldown
 
 type cooldown struct {
-	mu sync.RWMutex
+	mu lock.RWMutex
 	// CoolDownPeriod is the period to wait before deleting the branch ENI for propagation of ip tables rule for deleted pod
 	coolDownPeriod time.Duration
 }
