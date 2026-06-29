@@ -388,3 +388,46 @@ func TestAddNode_LockFreePathRunsInParallel(t *testing.T) {
 	assert.Equal(t, concurrency, g.maxInFlight, "all goroutines should be inside the lock-free section simultaneously")
 	assert.Len(t, m.dataStore, concurrency)
 }
+
+// TestManager_ConcurrentLockStress_NoDeadlock hammers the manager's public
+// lock-taking operations (AddNode/UpdateNode/GetNode/DeleteNode) from many
+// goroutines over a small shared set of node names. Under `-race` it guards
+// against data races on the datastore; under `-tags deadlock` (go-deadlock) it
+// guards against lock re-entry and lock-order inversion on the manager lock.
+// It is the load that exercises the manager lock when CI runs
+// `go test -tags deadlock -race ./...`.
+func TestManager_ConcurrentLockStress_NoDeadlock(t *testing.T) {
+	const (
+		concurrency   = 40
+		opsPerRoutine = 200
+		distinctNodes = 8
+	)
+	worker := &countingWorker{}
+	m := newConcurrencyManager(worker, nil)
+
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			for op := 0; op < opsPerRoutine; op++ {
+				name := fmt.Sprintf("node-%d", (seed+op)%distinctNodes)
+				switch op % 4 {
+				case 0:
+					_ = m.AddNode(name)
+				case 1:
+					_ = m.UpdateNode(name)
+				case 2:
+					_, _ = m.GetNode(name)
+				case 3:
+					_ = m.DeleteNode(name)
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// The real assertions are the race detector and go-deadlock not firing, plus
+	// the absence of a panic. Sanity-check the datastore never grew unbounded.
+	assert.LessOrEqual(t, len(m.dataStore), distinctNodes)
+}

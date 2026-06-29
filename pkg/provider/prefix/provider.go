@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/api"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/aws/ec2"
@@ -31,6 +30,7 @@ import (
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/provider/ip"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/provider/ip/eni"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils/lock"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/worker"
 
 	"github.com/go-logr/logr"
@@ -49,7 +49,7 @@ type ipv4PrefixProvider struct {
 	// config is the warm pool configuration for the resource prefix
 	config *config.WarmPoolConfig
 	// lock to allow multiple routines to access the cache concurrently
-	lock sync.RWMutex // guards the following
+	lock lock.RWMutex // guards the following
 	// instanceResources stores the ENIManager and the resource pool per instance
 	instanceProviderAndPool map[string]*ResourceProviderAndPool
 	// conditions is used to check which IP allocation mode is enabled
@@ -61,7 +61,7 @@ type ipv4PrefixProvider struct {
 // ResourceProviderAndPool contains the instance's ENI manager and the resource pool
 type ResourceProviderAndPool struct {
 	// lock guards the struct
-	lock         sync.RWMutex
+	lock         lock.RWMutex
 	eniManager   eni.ENIManager
 	resourcePool pool.Pool
 	// capacity is stored so that it can be advertised when node is updated

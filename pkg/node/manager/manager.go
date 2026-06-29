@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/aws/amazon-vpc-resource-controller-k8s/apis/vpcresources/v1alpha1"
@@ -29,6 +28,7 @@ import (
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/node"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/resource"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils/lock"
 	asyncWorker "github.com/aws/amazon-vpc-resource-controller-k8s/pkg/worker"
 	"github.com/google/uuid"
 	"github.com/samber/lo"
@@ -46,7 +46,7 @@ type manager struct {
 	// Log is the logger for node manager
 	Log logr.Logger
 	// lock to prevent multiple routines to write/update to data store concurrently
-	lock sync.RWMutex
+	lock lock.RWMutex
 	// dataStore is the in memory data store of all the managed/un-managed nodes in the cluster
 	dataStore map[string]node.Node
 	// resourceManager provides the resource provider for all supported resources

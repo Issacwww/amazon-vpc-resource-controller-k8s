@@ -19,7 +19,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/aws/ec2"
@@ -28,6 +27,7 @@ import (
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/aws/vpc"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/config"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/provider/branch/cooldown"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils/lock"
 	"github.com/samber/lo"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -112,7 +112,7 @@ type trunkENI struct {
 	// Log is the logger with the instance details
 	log logr.Logger
 	// lock is used to perform concurrent operation on the shared variables like the list of used vlan ids
-	lock sync.RWMutex
+	lock lock.RWMutex
 	// ec2ApiHelper is the wrapper interface that provides EC2 API helper functions
 	ec2ApiHelper api.EC2APIHelper
 	// trunkENIId is the interface id of the trunk network interface

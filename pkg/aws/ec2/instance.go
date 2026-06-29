@@ -16,11 +16,11 @@ package ec2
 import (
 	"fmt"
 	"strings"
-	"sync"
 
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/aws/ec2/api"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/aws/vpc"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils/lock"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/go-logr/logr"
@@ -31,7 +31,7 @@ type ec2Instance struct {
 	// log is the logger for the instance
 	log logr.Logger
 	// lock is to prevent concurrent writes to the fields of the ec2Instance
-	lock sync.RWMutex
+	lock lock.RWMutex
 	// name is the k8s name of the node
 	name string
 	// os is the operating system of the worker node

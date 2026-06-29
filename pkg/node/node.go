@@ -16,7 +16,6 @@ package node
 import (
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/aws/ec2"
@@ -25,6 +24,7 @@ import (
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/provider"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/resource"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils/lock"
 	v1 "k8s.io/api/core/v1"
 
 	"github.com/go-logr/logr"
@@ -32,7 +32,7 @@ import (
 
 type node struct {
 	// lock to perform serial operations on a node
-	lock sync.RWMutex
+	lock lock.RWMutex
 	// log is the logger setup with the key value pair set to node's name
 	log logr.Logger
 	// ready status indicates if the node is ready to process request or not
