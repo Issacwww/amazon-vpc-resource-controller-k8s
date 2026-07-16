@@ -20,6 +20,7 @@ import (
 	"reflect"
 	"testing"
 
+	rcv1alpha1 "github.com/aws/amazon-vpc-resource-controller-k8s/apis/vpcresources/v1alpha1"
 	mock_ec2 "github.com/aws/amazon-vpc-resource-controller-k8s/mocks/amazon-vcp-resource-controller-k8s/pkg/aws/ec2"
 	mock_k8s "github.com/aws/amazon-vpc-resource-controller-k8s/mocks/amazon-vcp-resource-controller-k8s/pkg/k8s"
 	mock_pod "github.com/aws/amazon-vpc-resource-controller-k8s/mocks/amazon-vcp-resource-controller-k8s/pkg/k8s/pod"
@@ -552,6 +553,51 @@ func TestBranchENIProvider_ProcessDeleteQueue(t *testing.T) {
 	result, err := provider.ProcessDeleteQueue(NodeName)
 	assert.NoError(t, err)
 	assert.Equal(t, deleteQueueRequeueRequest, result)
+}
+
+func TestBranchENIProvider_ReconcileUnassignedBranchENIs(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	provider, mockWorker := getProviderWithMockWorker(ctrl)
+	provider.trunkENICache = make(map[string]trunk.TrunkENI)
+	fakeTrunk := mock_trunk.NewMockTrunkENI(ctrl)
+	provider.trunkENICache[NodeName] = fakeTrunk
+
+	fakeTrunk.EXPECT().ReconcileUnassignedBranchENIs().Return(true, nil)
+	mockWorker.EXPECT().SubmitJob(worker.NewOnDemandProcessDeleteQueueJob(NodeName))
+
+	result, err := provider.ReconcileUnassignedBranchENIs(NodeName)
+
+	assert.NoError(t, err)
+	assert.Equal(t, k8sCtrl.Result{}, result)
+}
+
+func TestBranchENIProvider_InitTrunkFromCNINodeStatus(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	provider, _, _, mockK8sAPI := getProviderAndMocks(ctrl)
+	mockInstance := mock_ec2.NewMockEC2Instance(ctrl)
+	fakeTrunk := mock_trunk.NewMockTrunkENI(ctrl)
+	status := rcv1alpha1.CNINodeStatus{
+		TrunkENI: rcv1alpha1.TrunkENIStatus{
+			ID:       "eni-trunk",
+			SubnetID: "subnet-1",
+		},
+	}
+
+	mockInstance.EXPECT().LoadedFromCNINodeStatus().Return(true)
+	mockInstance.EXPECT().Name().Return(NodeName)
+	mockK8sAPI.EXPECT().GetCNINode(types.NamespacedName{Name: NodeName}).Return(&rcv1alpha1.CNINode{
+		Status: status,
+	}, nil)
+	fakeTrunk.EXPECT().InitTrunkFromStatus(status.TrunkENI, []v1.Pod{*MockPod1}).Return(nil)
+
+	initializedFromStatus, err := provider.initTrunk(mockInstance, fakeTrunk, []v1.Pod{*MockPod1}, provider.log)
+
+	assert.NoError(t, err)
+	assert.True(t, initializedFromStatus)
 }
 
 func TestBranchENIProvider_Introspect(t *testing.T) {

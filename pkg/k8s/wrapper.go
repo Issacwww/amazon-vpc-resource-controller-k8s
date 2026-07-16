@@ -84,6 +84,7 @@ type K8sWrapper interface {
 	CreateCNINode(node *v1.Node, clusterName string) error
 	ListCNINodes() ([]*rcv1alpha1.CNINode, error)
 	PatchCNINode(oldCNINode, newCNINode *rcv1alpha1.CNINode) error
+	UpdateCNINodeStatus(nodeName string, status rcv1alpha1.CNINodeStatus) error
 	DeleteCNINode(cniNode *rcv1alpha1.CNINode) error
 }
 
@@ -283,4 +284,19 @@ func (k *k8sWrapper) ListCNINodes() ([]*rcv1alpha1.CNINode, error) {
 
 func (k *k8sWrapper) PatchCNINode(oldCNINode, newCNINode *rcv1alpha1.CNINode) error {
 	return k.cacheClient.Patch(k.context, newCNINode, client.MergeFromWithOptions(oldCNINode, client.MergeFromWithOptimisticLock{}))
+}
+
+func (k *k8sWrapper) UpdateCNINodeStatus(nodeName string, status rcv1alpha1.CNINodeStatus) error {
+	request := types.NamespacedName{Name: nodeName}
+
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		cniNode := &rcv1alpha1.CNINode{}
+		if err := k.cacheClient.Get(k.context, request, cniNode); err != nil {
+			return err
+		}
+
+		newCNINode := cniNode.DeepCopy()
+		newCNINode.Status = status
+		return k.cacheClient.Status().Patch(k.context, newCNINode, client.MergeFrom(cniNode))
+	})
 }

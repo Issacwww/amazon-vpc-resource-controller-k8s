@@ -70,8 +70,78 @@ spec:
             type: object
           status:
             description: CNINodeStatus defines the managed VPC resources.
+            properties:
+              instance:
+                description: |-
+                  InstanceStatus stores the EC2 instance fields needed to reinitialize
+                  resource providers without synchronously describing the instance on restart.
+                properties:
+                  connectionTracking:
+                    description: ConnectionTrackingStatus stores primary ENI connection
+                      tracking settings.
+                    properties:
+                      tcpEstablishedTimeout:
+                        format: int32
+                        type: integer
+                      udpStreamTimeout:
+                        format: int32
+                        type: integer
+                      udpTimeout:
+                        format: int32
+                        type: integer
+                    type: object
+                  currentInstanceSecurityGroups:
+                    items:
+                      type: string
+                    type: array
+                  currentSubnetCIDRBlock:
+                    type: string
+                  currentSubnetID:
+                    type: string
+                  currentSubnetV6CIDRBlock:
+                    type: string
+                  instanceID:
+                    type: string
+                  instanceSubnetCIDRBlock:
+                    type: string
+                  instanceSubnetID:
+                    type: string
+                  instanceSubnetV6CIDRBlock:
+                    type: string
+                  instanceType:
+                    type: string
+                  primaryNetworkInterfaceID:
+                    type: string
+                  primaryNetworkInterfaceSecurityGroups:
+                    items:
+                      type: string
+                    type: array
+                  subnetMask:
+                    type: string
+                  subnetV6Mask:
+                    type: string
+                type: object
+              lastUpdated:
+                format: date-time
+                type: string
+              snapshotVersion:
+                type: string
+              trunkENI:
+                description: TrunkENIStatus stores the trunk ENI fields needed to
+                  rebuild the in-memory trunk cache.
+                properties:
+                  id:
+                    type: string
+                  securityGroups:
+                    items:
+                      type: string
+                    type: array
+                  subnetID:
+                    type: string
+                type: object
             type: object
         type: object
     served: true
     storage: true
-    subresources: {}
+    subresources:
+      status: {}

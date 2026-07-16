@@ -26,6 +26,7 @@ import (
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/resource"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/go-logr/logr"
 )
@@ -152,16 +153,19 @@ func (n *node) UpdateResources(resourceManager resource.ResourceManager) error {
 func (n *node) InitResources(resourceManager resource.ResourceManager) error {
 	n.lock.Lock()
 	defer n.lock.Unlock()
-	err := n.instance.LoadDetails(n.ec2API)
-	if err != nil {
-		if errors.Is(err, utils.ErrNotFound) {
-			// Send a node event for users' visibility
-			msg := fmt.Sprintf("The instance type %s is not supported yet by the vpc resource controller", n.instance.Type())
-			utils.SendNodeEventWithNodeName(n.k8sAPI, n.instance.Name(), utils.UnsupportedInstanceTypeReason, msg, v1.EventTypeWarning, n.log)
-		}
-		return &ErrInitResources{
-			Message: "failed to load instance details",
-			Err:     err,
+
+	if !n.tryHydrateInstanceFromCNINodeStatus() {
+		err := n.instance.LoadDetails(n.ec2API)
+		if err != nil {
+			if errors.Is(err, utils.ErrNotFound) {
+				// Send a node event for users' visibility
+				msg := fmt.Sprintf("The instance type %s is not supported yet by the vpc resource controller", n.instance.Type())
+				utils.SendNodeEventWithNodeName(n.k8sAPI, n.instance.Name(), utils.UnsupportedInstanceTypeReason, msg, v1.EventTypeWarning, n.log)
+			}
+			return &ErrInitResources{
+				Message: "failed to load instance details",
+				Err:     err,
+			}
 		}
 	}
 
@@ -195,6 +199,29 @@ func (n *node) InitResources(resourceManager resource.ResourceManager) error {
 
 	n.ready = true
 	return errInit
+}
+
+func (n *node) tryHydrateInstanceFromCNINodeStatus() bool {
+	if n.k8sAPI == nil {
+		return false
+	}
+
+	cniNode, err := n.k8sAPI.GetCNINode(types.NamespacedName{Name: n.instance.Name()})
+	if err != nil {
+		n.log.V(1).Info("could not get CNINode status snapshot, falling back to EC2 instance details",
+			"error", err)
+		return false
+	}
+
+	hydrated, reason := n.instance.HydrateFromCNINodeStatus(cniNode.Status)
+	if !hydrated {
+		n.log.V(1).Info("CNINode status snapshot is not usable, falling back to EC2 instance details",
+			"reason", reason)
+		return false
+	}
+
+	n.log.Info("hydrated instance details from CNINode status snapshot")
+	return true
 }
 
 // DeleteResources performs clean up of all the resource pools and provider of the nodes

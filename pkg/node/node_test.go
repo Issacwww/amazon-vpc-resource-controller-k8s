@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"testing"
 
+	rcv1alpha1 "github.com/aws/amazon-vpc-resource-controller-k8s/apis/vpcresources/v1alpha1"
 	mock_ec2 "github.com/aws/amazon-vpc-resource-controller-k8s/mocks/amazon-vcp-resource-controller-k8s/pkg/aws/ec2"
 	mock_api "github.com/aws/amazon-vpc-resource-controller-k8s/mocks/amazon-vcp-resource-controller-k8s/pkg/aws/ec2/api"
 	mock_k8s "github.com/aws/amazon-vpc-resource-controller-k8s/mocks/amazon-vcp-resource-controller-k8s/pkg/k8s"
@@ -125,6 +126,31 @@ func TestNode_InitResources(t *testing.T) {
 	assert.True(t, mock.NodeWithMock.IsReady())
 }
 
+func TestNode_InitResources_CNINodeStatusHydrated(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mock := NewMock(ctrl, 1)
+	mock.NodeWithMock.k8sAPI = mock.MockK8sAPI
+	status := rcv1alpha1.CNINodeStatus{
+		SnapshotVersion: rcv1alpha1.CNINodeStatusSnapshotVersion,
+	}
+
+	mock.MockInstance.EXPECT().Name().Return(nodeName)
+	mock.MockK8sAPI.EXPECT().GetCNINode(types.NamespacedName{Name: nodeName}).Return(&rcv1alpha1.CNINode{
+		Status: status,
+	}, nil)
+	mock.MockInstance.EXPECT().HydrateFromCNINodeStatus(status).Return(true, "hit")
+	mock.MockResourceManager.EXPECT().GetResourceProviders().Return(mock.ResourceProvider)
+	mock.MockProviders["0"].EXPECT().IsInstanceSupported(mock.MockInstance).Return(true)
+	mock.MockProviders["0"].EXPECT().InitResource(mock.MockInstance).Return(nil)
+
+	err := mock.NodeWithMock.InitResources(mock.MockResourceManager)
+
+	assert.NoError(t, err)
+	assert.True(t, mock.NodeWithMock.IsReady())
+}
+
 func TestNode_InitResources_InstanceNotTrunkSupported(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -156,7 +182,8 @@ func TestNode_InitResources_InstanceNotListed(t *testing.T) {
 	msg := "The instance type dummy.large is not supported yet by the vpc resource controller"
 
 	mock.MockInstance.EXPECT().Type().Return(testInstanceType).Times(1)
-	mock.MockInstance.EXPECT().Name().Return(nodeName).Times(1)
+	mock.MockInstance.EXPECT().Name().Return(nodeName).Times(2)
+	mock.MockK8sAPI.EXPECT().GetCNINode(types.NamespacedName{Name: nodeName}).Return(&rcv1alpha1.CNINode{}, mockError)
 	mock.MockK8sAPI.EXPECT().GetNode(nodeName).Return(node, nil).Times(1)
 	mock.MockK8sAPI.EXPECT().BroadcastEvent(node, "Unsupported", msg, v1.EventTypeWarning).Times(1)
 	mock.MockInstance.EXPECT().LoadDetails(mock.MockEC2API).Return(fmt.Errorf("unsupported instance type, couldn't find ENI Limit for instance %s, error: %w", testInstanceType, utils.ErrNotFound))

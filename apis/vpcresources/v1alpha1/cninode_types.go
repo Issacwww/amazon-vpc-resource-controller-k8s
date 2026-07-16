@@ -25,6 +25,11 @@ const (
 	CustomNetworking      FeatureName = "CustomNetworking"
 )
 
+const (
+	// CNINodeStatusSnapshotVersion is the version of the controller-owned status snapshot.
+	CNINodeStatusSnapshotVersion = "v1"
+)
+
 // Feature is a type of feature being supported by VPC resource controller and other AWS Services
 type Feature struct {
 	Name  FeatureName `json:"name,omitempty"`
@@ -41,12 +46,49 @@ type CNINodeSpec struct {
 
 // CNINodeStatus defines the managed VPC resources.
 type CNINodeStatus struct {
-	//TODO: add VPC resources which will be managed by this CRD and its finalizer
+	SnapshotVersion string         `json:"snapshotVersion,omitempty"`
+	LastUpdated     metav1.Time    `json:"lastUpdated,omitempty"`
+	Instance        InstanceStatus `json:"instance,omitempty"`
+	TrunkENI        TrunkENIStatus `json:"trunkENI,omitempty"`
+}
+
+// InstanceStatus stores the EC2 instance fields needed to reinitialize
+// resource providers without synchronously describing the instance on restart.
+type InstanceStatus struct {
+	InstanceID                            string                    `json:"instanceID,omitempty"`
+	InstanceType                          string                    `json:"instanceType,omitempty"`
+	InstanceSubnetID                      string                    `json:"instanceSubnetID,omitempty"`
+	InstanceSubnetCIDRBlock               string                    `json:"instanceSubnetCIDRBlock,omitempty"`
+	InstanceSubnetV6CIDRBlock             string                    `json:"instanceSubnetV6CIDRBlock,omitempty"`
+	CurrentSubnetID                       string                    `json:"currentSubnetID,omitempty"`
+	CurrentSubnetCIDRBlock                string                    `json:"currentSubnetCIDRBlock,omitempty"`
+	CurrentSubnetV6CIDRBlock              string                    `json:"currentSubnetV6CIDRBlock,omitempty"`
+	CurrentInstanceSecurityGroups         []string                  `json:"currentInstanceSecurityGroups,omitempty"`
+	SubnetMask                            string                    `json:"subnetMask,omitempty"`
+	SubnetV6Mask                          string                    `json:"subnetV6Mask,omitempty"`
+	PrimaryNetworkInterfaceID             string                    `json:"primaryNetworkInterfaceID,omitempty"`
+	PrimaryNetworkInterfaceSecurityGroups []string                  `json:"primaryNetworkInterfaceSecurityGroups,omitempty"`
+	ConnectionTracking                    *ConnectionTrackingStatus `json:"connectionTracking,omitempty"`
+}
+
+// ConnectionTrackingStatus stores primary ENI connection tracking settings.
+type ConnectionTrackingStatus struct {
+	TCPEstablishedTimeout *int32 `json:"tcpEstablishedTimeout,omitempty"`
+	UDPStreamTimeout      *int32 `json:"udpStreamTimeout,omitempty"`
+	UDPTimeout            *int32 `json:"udpTimeout,omitempty"`
+}
+
+// TrunkENIStatus stores the trunk ENI fields needed to rebuild the in-memory trunk cache.
+type TrunkENIStatus struct {
+	ID             string   `json:"id,omitempty"`
+	SubnetID       string   `json:"subnetID,omitempty"`
+	SecurityGroups []string `json:"securityGroups,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:printcolumn:name="Features",type=string,JSONPath=`.spec.features`,description="The features delegated to VPC resource controller"
 // +kubebuilder:resource:shortName=cnd,scope=Cluster
+// +kubebuilder:subresource:status
 
 // +kubebuilder:object:root=true
 type CNINode struct {

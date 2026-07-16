@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"testing"
 
+	rcv1alpha1 "github.com/aws/amazon-vpc-resource-controller-k8s/apis/vpcresources/v1alpha1"
 	mock_api "github.com/aws/amazon-vpc-resource-controller-k8s/mocks/amazon-vcp-resource-controller-k8s/pkg/aws/ec2/api"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils"
 
@@ -423,4 +424,93 @@ func TestEc2Instance_LoadDetails_InvalidCustomNetworkingConfiguration(t *testing
 	// Expect the primary network interface security groups when ENIConfig SG is missing
 	assert.Equal(t, []string{securityGroup1, securityGroup2}, ec2Instance.currentInstanceSecurityGroups)
 	assert.Equal(t, customNWSubnetCidr, ec2Instance.currentSubnetCIDRBlock)
+}
+
+func TestEc2Instance_HydrateFromCNINodeStatus(t *testing.T) {
+	tcpTimeout := int32(300)
+	udpStreamTimeout := int32(120)
+	udpTimeout := int32(30)
+
+	ec2Instance := ec2Instance{
+		instanceID: instanceID,
+		os:         os,
+		name:       nodeName,
+	}
+
+	status := rcv1alpha1.CNINodeStatus{
+		SnapshotVersion: rcv1alpha1.CNINodeStatusSnapshotVersion,
+		Instance: rcv1alpha1.InstanceStatus{
+			InstanceID:                            instanceID,
+			InstanceType:                          string(instanceType),
+			InstanceSubnetID:                      subnetID,
+			InstanceSubnetCIDRBlock:               subnetCidrBlock,
+			CurrentSubnetID:                       subnetID,
+			CurrentSubnetCIDRBlock:                subnetCidrBlock,
+			CurrentInstanceSecurityGroups:         []string{securityGroup2, securityGroup1},
+			SubnetMask:                            "16",
+			PrimaryNetworkInterfaceID:             primaryInterfaceID,
+			PrimaryNetworkInterfaceSecurityGroups: []string{securityGroup1, securityGroup2},
+			ConnectionTracking: &rcv1alpha1.ConnectionTrackingStatus{
+				TCPEstablishedTimeout: &tcpTimeout,
+				UDPStreamTimeout:      &udpStreamTimeout,
+				UDPTimeout:            &udpTimeout,
+			},
+		},
+		TrunkENI: rcv1alpha1.TrunkENIStatus{
+			ID:       "eni-trunk",
+			SubnetID: subnetID,
+		},
+	}
+
+	hydrated, reason := ec2Instance.HydrateFromCNINodeStatus(status)
+	assert.True(t, hydrated)
+	assert.Equal(t, "hit", reason)
+	assert.True(t, ec2Instance.LoadedFromCNINodeStatus())
+	assert.Equal(t, subnetID, ec2Instance.SubnetID())
+	assert.Equal(t, subnetCidrBlock, ec2Instance.SubnetCidrBlock())
+	assert.Equal(t, string(instanceType), ec2Instance.Type())
+	assert.Equal(t, []string{securityGroup2, securityGroup1}, ec2Instance.CurrentInstanceSecurityGroups())
+	assert.Equal(t, primaryInterfaceID, ec2Instance.PrimaryNetworkInterfaceID())
+
+	gotTCP, gotUDPStream, gotUDP := ec2Instance.GetConnectionTrackingSpec()
+	assert.Equal(t, tcpTimeout, *gotTCP)
+	assert.Equal(t, udpStreamTimeout, *gotUDPStream)
+	assert.Equal(t, udpTimeout, *gotUDP)
+	assert.Equal(t, status.Instance, ec2Instance.CNINodeStatus())
+}
+
+func TestEc2Instance_HydrateFromCNINodeStatus_CustomNetworkingMismatch(t *testing.T) {
+	ec2Instance := ec2Instance{
+		instanceID:                  instanceID,
+		os:                          os,
+		name:                        nodeName,
+		newCustomNetworkingSubnetID: "subnet-custom",
+		newCustomNetworkingSecurityGroups: []string{
+			securityGroup3,
+		},
+	}
+
+	status := rcv1alpha1.CNINodeStatus{
+		SnapshotVersion: rcv1alpha1.CNINodeStatusSnapshotVersion,
+		Instance: rcv1alpha1.InstanceStatus{
+			InstanceID:                            instanceID,
+			InstanceType:                          string(instanceType),
+			InstanceSubnetID:                      subnetID,
+			InstanceSubnetCIDRBlock:               subnetCidrBlock,
+			CurrentSubnetID:                       subnetID,
+			CurrentSubnetCIDRBlock:                subnetCidrBlock,
+			CurrentInstanceSecurityGroups:         []string{securityGroup1},
+			PrimaryNetworkInterfaceID:             primaryInterfaceID,
+			PrimaryNetworkInterfaceSecurityGroups: []string{securityGroup1},
+		},
+		TrunkENI: rcv1alpha1.TrunkENIStatus{
+			ID:       "eni-trunk",
+			SubnetID: subnetID,
+		},
+	}
+
+	hydrated, reason := ec2Instance.HydrateFromCNINodeStatus(status)
+	assert.False(t, hydrated)
+	assert.Equal(t, "custom_networking_subnet_mismatch", reason)
+	assert.False(t, ec2Instance.LoadedFromCNINodeStatus())
 }
