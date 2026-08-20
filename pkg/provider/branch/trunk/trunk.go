@@ -256,6 +256,20 @@ const (
 	ledgerVerifyResultError    = "error"
 )
 
+// eniPhase is the lifecycle phase of an entry in trunkENI.inFlightENIs: an ENI the controller
+// is actively operating on, which exists (attached or not) in EC2 while temporarily outside
+// both the pod-owned ledger and the delete queue.
+type eniPhase string
+
+const (
+	// eniPhaseCreating: CreateNetworkInterface returned, addBranchToCache has not run yet
+	// (M5 G1, design doc section 2.6 - hazard H-A window).
+	eniPhaseCreating eniPhase = "creating"
+	// eniPhaseDeleting: popped from the delete queue, its EC2 disassociate/delete call is in
+	// flight (the pop window, design doc section 4.1 H-C).
+	eniPhaseDeleting eniPhase = "deleting"
+)
+
 type TrunkENI interface {
 	// InitTrunk initializes trunk interface
 	InitTrunk(instance ec2.EC2Instance, pods []v1.Pod) error
@@ -320,14 +334,25 @@ type trunkENI struct {
 	// AssociateTrunkInterface. CreateAndAssociateBranchENIs therefore verifies the ledger from
 	// EC2 (verifyBranchLedger) before the first allocation on a hydrated trunk.
 	branchLedgerVerified bool
-	// pendingCreates is the set of branch ENI IDs that exist in EC2 but are not yet in
-	// uidToBranchENIMap (M5 G1, design doc section 2.6). CreateAndAssociateBranchENIs adds an ID
-	// right after CreateNetworkInterface returns and removes it on EVERY exit for that ENI:
-	// success (addBranchToCache) or failure (PushENIsToFrontOfDeleteQueue). The ledger-verify
-	// gate and the orphan reclaim sweep never classify a pending ENI as an orphan - without this,
-	// an in-flight create in the Associate-to-cache window could be deleted from under a live pod
-	// (hazard H-A). Only needs to live within a single controller lifetime. Guarded by lock.
-	pendingCreates map[string]struct{}
+	// inFlightENIs is the set of branch ENI IDs the controller is actively operating on: they
+	// exist in EC2 while temporarily outside both uidToBranchENIMap and the delete queue, so
+	// the ledger-verify gate, the orphan reclaim sweep, and the error-driven reclaim must never
+	// classify them as orphans. Two phases share one set because the classification rule is
+	// identical; the phase only attributes logs/metrics:
+	//   - creating (M5 G1, design doc section 2.6): added right after CreateNetworkInterface
+	//     returns, removed on EVERY exit for that ENI - success (addBranchToCache) or failure
+	//     (PushENIsToFrontOfDeleteQueue). Without it an in-flight create in the
+	//     Associate-to-cache window could be deleted from under a live pod (hazard H-A).
+	//   - deleting (the pop window, design doc section 4.1 H-C): added when the ENI is popped
+	//     from the delete queue, removed when its processing pass ends - delete success or
+	//     forgotten (DeleteCooledDownENIs), or re-queue (PushENIsToFrontOfDeleteQueue, which
+	//     clears the marker before its dedup check so the pipeline's own re-push always
+	//     passes). Without it a concurrent describe during the in-flight EC2 disassociate/
+	//     delete call would re-enqueue the ENI as a duplicate orphan.
+	// Only needs to live within a single controller lifetime: on restart an in-flight ENI
+	// becomes a true orphan and is reconciled by the gate/sweep like any other (the same
+	// argument as section 4.2 H-A). Guarded by lock.
+	inFlightENIs map[string]eniPhase
 	// lastErrorDrivenReclaim is when the error-driven orphan reclaim (M3, design doc section 2.4)
 	// last ran a describe for this trunk. It bounds that failure-path reclaim to at most one
 	// describe per errorDrivenReclaimWindow so a persistent EC2 error cannot turn pod-reconcile
@@ -491,7 +516,7 @@ func NewTrunkENI(logger logr.Logger, instance ec2.EC2Instance, helper api.EC2API
 		instance:          instance,
 		uidToBranchENIMap: make(map[string][]*ENIDetails),
 		eniToPodUID:       make(map[string]string),
-		pendingCreates:    make(map[string]struct{}),
+		inFlightENIs:      make(map[string]eniPhase),
 		vlanOwner:         make(map[int]string),
 		vlanReleasedAt:    make(map[int]time.Time),
 		nodeIDTag: []ec2types.Tag{
@@ -713,9 +738,9 @@ func (t *trunkENI) reclaimOrphansAfterAddFailure(cause error) {
 }
 
 // knownBranchENIsLocked builds the set of branch ENI IDs the controller knows about: the
-// pod-owned ledger UNION the delete queue UNION the pending-creates set (M5 G1+G2, design doc
-// section 2.6). Only an attached branch ENI OUTSIDE this set is an orphan. Caller must hold the
-// trunk lock (read or write).
+// pod-owned ledger UNION the delete queue UNION the in-flight set (creating: M5 G1; deleting:
+// the pop window - design doc sections 2.6 and 4.1 H-C). Only an attached branch ENI OUTSIDE
+// this set is an orphan. Caller must hold the trunk lock (read or write).
 func (t *trunkENI) knownBranchENIsLocked() map[string]struct{} {
 	knownBranchENIs := make(map[string]struct{})
 	for _, branchENIs := range t.uidToBranchENIMap {
@@ -726,7 +751,7 @@ func (t *trunkENI) knownBranchENIsLocked() map[string]struct{} {
 	for _, eni := range t.deleteQueue {
 		knownBranchENIs[eni.ID] = struct{}{}
 	}
-	for eniID := range t.pendingCreates {
+	for eniID := range t.inFlightENIs {
 		knownBranchENIs[eniID] = struct{}{}
 	}
 	return knownBranchENIs
@@ -1084,11 +1109,12 @@ func (t *trunkENI) CreateAndAssociateBranchENIs(pod *v1.Pod, securityGroups []st
 			"vlanID", vlanID, "eniID", *nwInterface.NetworkInterfaceId, "podUID", string(pod.UID))
 
 		// M5 G1 (design doc section 2.6): the ENI now exists in EC2 but is not yet in
-		// uidToBranchENIMap. Record it as in-flight so the ledger-verify gate and the orphan
-		// reclaim sweep never classify it as an orphan (hazard H-A). Removed on every exit for
-		// this ENI: success via addBranchToCache, failure via PushENIsToFrontOfDeleteQueue.
-		// The ENI ID is known now, so also record it as the owner of its VLAN (M5 G3).
-		t.addPendingCreate(*nwInterface.NetworkInterfaceId, vlanID, string(pod.UID))
+		// uidToBranchENIMap. Record it as in-flight (phase=creating) so the ledger-verify gate
+		// and the orphan reclaim sweep never classify it as an orphan (hazard H-A). Removed on
+		// every exit for this ENI: success via addBranchToCache, failure via
+		// PushENIsToFrontOfDeleteQueue. The ENI ID is known now, so also record it as the owner
+		// of its VLAN (M5 G3).
+		t.addInFlightCreate(*nwInterface.NetworkInterfaceId, vlanID, string(pod.UID))
 
 		// Branch ENI can have an IPv4 address, IPv6 address, or both
 		var v4Addr, v6Addr string
@@ -1115,8 +1141,8 @@ func (t *trunkENI) CreateAndAssociateBranchENIs(pod *v1.Pod, securityGroups []st
 			// M3 (design doc section 2.4): the branch could not be added to the trunk, so EC2 and
 			// the ledger disagree - an orphan may be holding the slot or this VLAN. Reclaim it so
 			// the pod's retry has capacity, instead of looping create/delete forever (hazard E4).
-			// This ENI is still in pendingCreates here, so the shared known set keeps the reclaim
-			// from enqueueing the ENI we are about to hand to the delete queue ourselves.
+			// This ENI is still in the in-flight set here, so the shared known set keeps the
+			// reclaim from enqueueing the ENI we are about to hand to the delete queue ourselves.
 			t.reclaimOrphansAfterAddFailure(err)
 			break
 		}
@@ -1128,7 +1154,7 @@ func (t *trunkENI) CreateAndAssociateBranchENIs(pod *v1.Pod, securityGroups []st
 		// Moving to delete list, because it has all the retrying logic in case of failure.
 		// nil pod: this pod was never added to uidToBranchENIMap (addBranchToCache runs only on
 		// full success), so there is no cache entry to remove; ownership for the lifecycle logs
-		// was already recorded per-ENI by addPendingCreate above.
+		// was already recorded per-ENI by addInFlightCreate above.
 		t.PushENIsToFrontOfDeleteQueue(nil, newENIs)
 		return nil, err
 	}
@@ -1194,12 +1220,16 @@ func (t *trunkENI) DeleteCooledDownENIs() {
 					// orphan PRODUCER that a later orphan reclaim sweep will rediscover. Count it so
 					// orphan production is observable alongside branch_eni_orphan_reclaimed_total.
 					branchENIDeleteForgottenCount.WithLabelValues("max_delete_retries_exceeded").Inc()
+					// Deliberately dropped from the in-flight set too: from here on the sweep
+					// SHOULD rediscover it as an orphan - that is its recovery path.
+					t.removeInFlight(eni)
 					continue
 				}
 				t.log.Error(err, "failed to delete eni, will retry", "eni", eni)
 				t.PushENIsToFrontOfDeleteQueue(nil, []*ENIDetails{eni})
 				continue
 			}
+			t.removeInFlight(eni)
 			t.log.V(1).Info("deleted eni successfully", "eni", eni, "deletion time", time.Now(),
 				"pushed to queue time", eni.deletionTimeStamp)
 		} else {
@@ -1366,13 +1396,21 @@ func (t *trunkENI) pushUnassignedBranchInterfacesToDeleteQueue(branchInterfaces 
 		}
 		branchENIID := *branchInterface.NetworkInterfaceId
 
-		// M5 G1 (design doc section 2.6): an ENI still being created (in EC2 but not yet in the
-		// ledger) is in-flight, not an orphan - deleting it would pull the ENI from under a live
-		// pod (hazard H-A). Re-checked here at enqueue time under the lock because the caller's
-		// known-set snapshot may predate a create that finished during the EC2 describe. Not
-		// counted as a discovered orphan.
-		if _, pending := t.pendingCreates[branchENIID]; pending {
-			t.log.Info("skipping in-flight branch eni, create in progress", "eni", branchENIID)
+		// M5 G1 + pop window (design doc sections 2.6, 4.1 H-C): an ENI the controller is
+		// actively operating on is in-flight, not an orphan. Re-checked here at enqueue time
+		// under the lock because the caller's known-set snapshot may predate a create or a
+		// delete-queue pop that happened during the EC2 describe. Not counted as a discovered
+		// orphan. The phase only attributes the log/metric:
+		//   - creating: deleting it would pull the ENI from under a live pod (hazard H-A);
+		//   - deleting: it is mid-processing in the delete pipeline - re-enqueueing would
+		//     duplicate it (G2's dedup extended to the pop window), so count it as a dedup.
+		if phase, inFlight := t.inFlightENIs[branchENIID]; inFlight {
+			if phase == eniPhaseCreating {
+				t.log.Info("skipping in-flight branch eni, create in progress", "eni", branchENIID)
+			} else {
+				branchENIDeleteQueueDedupCount.Inc()
+				t.log.Info("skipping branch eni, delete processing in progress", "eni", branchENIID)
+			}
 			continue
 		}
 		// M5 G2 (design doc section 2.6): an ENI already awaiting deletion is being processed,
@@ -1432,9 +1470,13 @@ func (t *trunkENI) PushENIsToFrontOfDeleteQueue(pod *v1.Pod, eniList []*ENIDetai
 	t.lock.Lock()
 	defer t.lock.Unlock()
 
-	// M5 G1 (design doc section 2.6): an in-flight create pushed here (create/associate failure
-	// path) has terminally exited the create flow - it must not stay in the pending set.
-	t.removePendingCreatesLocked(eniList)
+	// Clear in-flight markers before the dedup check below: a create pushed here
+	// (create/associate failure path) has terminally exited the create flow (M5 G1), and a
+	// popped delete-queue entry being re-pushed (retry / not-yet-cooled-down) is re-entering
+	// the queue - clearing first is what lets the delete pipeline's own re-push pass the
+	// dedup check while a concurrent describe still cannot touch the ENI (it re-checks the
+	// queue it is about to rejoin).
+	t.removeInFlightLocked(eniList)
 
 	if pod != nil {
 		for _, eni := range eniList {
@@ -1471,6 +1513,13 @@ func (t *trunkENI) popENIFromDeleteQueue() (eni *ENIDetails, hasENI bool) {
 		eni = t.deleteQueue[0]
 		hasENI = true
 		t.deleteQueue = t.deleteQueue[1:]
+		// The popped entry leaves ledger-UNION-queue while its EC2 disassociate/delete call is
+		// in flight. Mark it in-flight (phase=deleting) so a concurrent gate/sweep/M3 describe -
+		// which still sees it attached in EC2 - cannot re-classify it as an orphan and enqueue a
+		// duplicate (the pop window, design doc section 4.1 H-C). Cleared when the processing
+		// pass ends: delete success/forgotten in DeleteCooledDownENIs, or re-queue via
+		// PushENIsToFrontOfDeleteQueue.
+		t.inFlightENIs[eni.ID] = eniPhaseDeleting
 	}
 
 	return eni, hasENI
@@ -1482,9 +1531,9 @@ func (t *trunkENI) addBranchToCache(UID string, branchENIs []*ENIDetails) {
 	defer t.lock.Unlock()
 
 	// M5 G1 (design doc section 2.6): the ENIs are entering the pod-owned ledger, so they are no
-	// longer in-flight. Done before the duplicate-UID early return so a pending entry can never
+	// longer in-flight. Done before the duplicate-UID early return so a stale marker can never
 	// be left behind on any exit.
-	t.removePendingCreatesLocked(branchENIs)
+	t.removeInFlightLocked(branchENIs)
 
 	if _, ok := t.uidToBranchENIMap[UID]; ok {
 		t.log.Info("branch eni already exist not adding again", "request", branchENIs)
@@ -1592,15 +1641,15 @@ func (t *trunkENI) markVlanAssignedWithOwnerLocked(vlanId int, eniID string) err
 	return nil
 }
 
-// addPendingCreate records eniID as an in-flight branch ENI create (M5 G1, design doc section
+// addInFlightCreate records eniID as an in-flight branch ENI create (M5 G1, design doc section
 // 2.6) and, since the ENI ID is now known, records it as the owner of vlanID (M5 G3). Must be
-// removed via removePendingCreatesLocked on every exit for this ENI. podUID is the owning pod
+// removed via removeInFlightLocked on every exit for this ENI. podUID is the owning pod
 // for VLAN lifecycle logs; pass "" when unknown.
-func (t *trunkENI) addPendingCreate(eniID string, vlanID int, podUID string) {
+func (t *trunkENI) addInFlightCreate(eniID string, vlanID int, podUID string) {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 
-	t.pendingCreates[eniID] = struct{}{}
+	t.inFlightENIs[eniID] = eniPhaseCreating
 	t.rememberPodUIDLocked(eniID, podUID)
 	if vlanID != 0 {
 		t.vlanOwner[vlanID] = eniID
@@ -1629,12 +1678,20 @@ func (t *trunkENI) podUIDForENI(eniID string) string {
 	return t.eniToPodUID[eniID]
 }
 
-// removePendingCreatesLocked removes each ENI's ID from the pending-creates set (M5 G1, design
-// doc section 2.6). Caller must hold the trunk lock.
-func (t *trunkENI) removePendingCreatesLocked(enis []*ENIDetails) {
+// removeInFlightLocked removes each ENI's ID from the in-flight set - a create entering the
+// ledger or exiting to the delete queue (M5 G1), or a delete-queue pop whose processing pass
+// has ended (pop window). Caller must hold the trunk lock.
+func (t *trunkENI) removeInFlightLocked(enis []*ENIDetails) {
 	for _, eni := range enis {
-		delete(t.pendingCreates, eni.ID)
+		delete(t.inFlightENIs, eni.ID)
 	}
+}
+
+// removeInFlight is removeInFlightLocked for a single ENI, taking the lock itself.
+func (t *trunkENI) removeInFlight(eni *ENIDetails) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	delete(t.inFlightENIs, eni.ID)
 }
 
 // freeVlanId frees a vlan ID currently used by a network interface. eniID is the ENI releasing
