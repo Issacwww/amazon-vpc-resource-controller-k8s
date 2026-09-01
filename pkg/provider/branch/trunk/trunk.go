@@ -15,6 +15,7 @@ package trunk
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -32,6 +33,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsEc2 "github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/smithy-go"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
@@ -807,7 +809,9 @@ func (t *trunkENI) createAndAssociateBranchENIs(pod *v1.Pod, securityGroups []st
 		if err != nil {
 			err = fmt.Errorf("associating branch to trunk, %w", err)
 			trunkENIOperationsErrCount.WithLabelValues("associate_branch").Inc()
-			t.reclaimOrphansOnAssociateFailure()
+			if isLedgerContradictionError(err) {
+				t.reclaimOrphansOnAssociateFailure()
+			}
 			break
 		}
 		newENI.AssociationID = *associationOutput.InterfaceAssociation.AssociationId
@@ -842,6 +846,19 @@ func (t *trunkENI) createAndAssociateBranchENIs(pod *v1.Pod, securityGroups []st
 		"security group used", securityGroups)
 
 	return newENIs, nil
+}
+
+// isLedgerContradictionError reports whether an AssociateTrunkInterface failure
+// indicates EC2 holds branch state the local ledger does not know about, which
+// is the only signal worth a reclaim describe. When the ledger under-counts,
+// assignVlanId hands out the lowest VLAN the ledger believes free, which is
+// exactly the slot an orphan holds, so the contradiction surfaces as
+// InvalidVlanId.Duplicate. Throttling, permission, and transient EC2 errors
+// must not trigger a describe: it would add read load exactly when EC2 asks
+// for backoff, and a reclaim cannot fix them.
+func isLedgerContradictionError(err error) bool {
+	var apiErr smithy.APIError
+	return errors.As(err, &apiErr) && apiErr.ErrorCode() == ec2Errors.DuplicateVlanID
 }
 
 // reclaimOrphansOnAssociateFailure runs at most one describe for concurrent

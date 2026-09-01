@@ -27,11 +27,13 @@ import (
 	mock_cooldown "github.com/aws/amazon-vpc-resource-controller-k8s/mocks/amazon-vcp-resource-controller-k8s/pkg/provider/branch/cooldown"
 
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/aws/ec2"
+	ec2Errors "github.com/aws/amazon-vpc-resource-controller-k8s/pkg/aws/errors"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/aws/vpc"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/config"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/provider/branch/cooldown"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/smithy-go"
 	awsEc2 "github.com/aws/aws-sdk-go-v2/service/ec2"
 	awsEc2Types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/golang/mock/gomock"
@@ -220,6 +222,10 @@ var (
 	}
 
 	MockError = fmt.Errorf("mock error")
+	// MockDuplicateVlanError carries the EC2 error code that marks a ledger
+	// contradiction and therefore triggers reactive orphan reclaim in tests.
+	MockDuplicateVlanError = fmt.Errorf("associating: %w", &smithy.GenericAPIError{
+		Code: ec2Errors.DuplicateVlanID, Message: "VlanId '2' is in use"})
 )
 
 // queuedENIIDs returns the delete queue contents by id, so assertions do not depend
@@ -280,6 +286,46 @@ func getMockTrunk() trunkENI {
 func TestNewTrunkENI(t *testing.T) {
 	trunkENI := NewTrunkENI(zap.New(), FakeInstance, nil)
 	assert.NotNil(t, trunkENI)
+}
+
+// TestIsLedgerContradictionError verifies only the duplicate-VLAN code counts
+// as a contradiction; throttling and plain errors must not trigger reclaim.
+func TestIsLedgerContradictionError(t *testing.T) {
+	assert.True(t, isLedgerContradictionError(MockDuplicateVlanError))
+	assert.False(t, isLedgerContradictionError(MockError))
+	assert.False(t, isLedgerContradictionError(fmt.Errorf("wrap: %w",
+		&smithy.GenericAPIError{Code: "RequestLimitExceeded", Message: "Request limit exceeded."})))
+	assert.False(t, isLedgerContradictionError(fmt.Errorf("wrap: %w",
+		&smithy.GenericAPIError{Code: "UnauthorizedOperation", Message: "not authorized"})))
+	assert.False(t, isLedgerContradictionError(nil))
+}
+
+// TestTrunkENI_CreateAndAssociateBranchENIs_NoReclaimOnThrottle verifies a
+// throttled association does not spend a describe: no GetBranchNetworkInterface
+// expectation is registered, so a reclaim attempt would fail the mock.
+func TestTrunkENI_CreateAndAssociateBranchENIs_NoReclaimOnThrottle(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	trunkENI, mockEC2APIHelper, mockInstance := getMockHelperInstanceAndTrunkObject(ctrl)
+	trunkENI.trunkENIId = trunkId
+	throttleErr := fmt.Errorf("associating: %w", &smithy.GenericAPIError{
+		Code: "RequestLimitExceeded", Message: "Request limit exceeded."})
+
+	mockInstance.EXPECT().Type().Return(InstanceType).AnyTimes()
+	mockInstance.EXPECT().InstanceID().Return(InstanceId).AnyTimes()
+	mockInstance.EXPECT().SubnetID().Return(SubnetId).AnyTimes()
+	mockInstance.EXPECT().SubnetCidrBlock().Return(SubnetCidrBlock).AnyTimes()
+	mockInstance.EXPECT().SubnetV6CidrBlock().Return(SubnetV6CidrBlock).AnyTimes()
+	mockInstance.EXPECT().GetConnectionTrackingSpec().Return(nil, nil, nil).AnyTimes()
+
+	mockEC2APIHelper.EXPECT().CreateNetworkInterface(&BranchEniDescription, &SubnetId, SecurityGroups,
+		gomock.Any(), nil, nil, gomock.Any()).Return(BranchInterface1, nil)
+	mockEC2APIHelper.EXPECT().AssociateBranchToTrunk(&trunkId, &Branch1Id, gomock.Any()).
+		Return(nil, throttleErr)
+
+	_, err := trunkENI.CreateAndAssociateBranchENIs(MockPod2, SecurityGroups, 1, nil)
+	assert.Error(t, err)
 }
 
 func TestTrunkENI_reclaimOrphansOnAssociateFailure(t *testing.T) {
@@ -1631,7 +1677,7 @@ func TestTrunkENI_CreateAndAssociateBranchENIs_ErrorAssociate(t *testing.T) {
 		mockEC2APIHelper.EXPECT().AssociateBranchToTrunk(&trunkId, &Branch1Id, VlanId1).Return(mockAssociationOutput1, nil),
 		mockEC2APIHelper.EXPECT().CreateNetworkInterface(&BranchEniDescription, &SubnetId, SecurityGroups,
 			append(vlan2Tag, trunkENI.nodeIDTag...), nil, nil, gomock.Any()).Return(BranchInterface2, nil),
-		mockEC2APIHelper.EXPECT().AssociateBranchToTrunk(&trunkId, &Branch2Id, VlanId2).Return(nil, MockError),
+		mockEC2APIHelper.EXPECT().AssociateBranchToTrunk(&trunkId, &Branch2Id, VlanId2).Return(nil, MockDuplicateVlanError),
 	)
 	mockEC2APIHelper.EXPECT().GetBranchNetworkInterface(&trunkId, &SubnetId).Return(nil, nil)
 
@@ -1665,7 +1711,7 @@ func TestTrunkENI_CreateAndAssociateBranchENIs_ErrorAssociate_NoSelfDoubleEnqueu
 		mockEC2APIHelper.EXPECT().AssociateBranchToTrunk(&trunkId, &Branch1Id, VlanId1).Return(mockAssociationOutput1, nil),
 		mockEC2APIHelper.EXPECT().CreateNetworkInterface(&BranchEniDescription, &SubnetId, SecurityGroups,
 			append(vlan2Tag, trunkENI.nodeIDTag...), nil, nil, gomock.Any()).Return(BranchInterface2, nil),
-		mockEC2APIHelper.EXPECT().AssociateBranchToTrunk(&trunkId, &Branch2Id, VlanId2).Return(nil, MockError),
+		mockEC2APIHelper.EXPECT().AssociateBranchToTrunk(&trunkId, &Branch2Id, VlanId2).Return(nil, MockDuplicateVlanError),
 	)
 	mockEC2APIHelper.EXPECT().GetBranchNetworkInterface(&trunkId, &SubnetId).
 		Return([]*awsEc2Types.NetworkInterface{
@@ -1814,7 +1860,7 @@ func TestTrunkENI_HiddenOrphan_ReachesCapacityError(t *testing.T) {
 	mockHelper.EXPECT().CreateNetworkInterface(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
 		gomock.Any(), gomock.Any(), gomock.Any()).Return(BranchInterface1, nil)
 	// EC2 is actually full because of the orphan, so the association is rejected.
-	mockHelper.EXPECT().AssociateBranchToTrunk(&trunkId, &Branch1Id, gomock.Any()).Return(nil, MockError)
+	mockHelper.EXPECT().AssociateBranchToTrunk(&trunkId, &Branch1Id, gomock.Any()).Return(nil, MockDuplicateVlanError)
 	mockHelper.EXPECT().GetBranchNetworkInterface(&trunkId, &SubnetId).Return(nil, nil)
 
 	// First attempt: the local ledger says there is room.
@@ -1857,7 +1903,7 @@ func TestTrunkENI_HiddenOrphan_DeleteWorkerWinsRace(t *testing.T) {
 	mockInstance.EXPECT().GetConnectionTrackingSpec().Return(nil, nil, nil).AnyTimes()
 	mockHelper.EXPECT().CreateNetworkInterface(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
 		gomock.Any(), gomock.Any(), gomock.Any()).Return(BranchInterface1, nil).AnyTimes()
-	mockHelper.EXPECT().AssociateBranchToTrunk(&trunkId, &Branch1Id, gomock.Any()).Return(nil, MockError).AnyTimes()
+	mockHelper.EXPECT().AssociateBranchToTrunk(&trunkId, &Branch1Id, gomock.Any()).Return(nil, MockDuplicateVlanError).AnyTimes()
 	mockHelper.EXPECT().GetBranchNetworkInterface(&trunkId, &SubnetId).Return(nil, nil)
 	mockHelper.EXPECT().DeleteNetworkInterface(&Branch1Id).Return(nil).AnyTimes()
 
@@ -2037,7 +2083,7 @@ func TestTrunkENI_DeleteCooledDownENIs_FailedAllocationDoesNotBlockQueue(t *test
 	mockInstance.EXPECT().GetConnectionTrackingSpec().Return(nil, nil, nil).AnyTimes()
 	mockHelper.EXPECT().CreateNetworkInterface(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(),
 		gomock.Any(), gomock.Any(), gomock.Any()).Return(BranchInterface1, nil)
-	mockHelper.EXPECT().AssociateBranchToTrunk(&trunkId, &Branch1Id, gomock.Any()).Return(nil, MockError)
+	mockHelper.EXPECT().AssociateBranchToTrunk(&trunkId, &Branch1Id, gomock.Any()).Return(nil, MockDuplicateVlanError)
 	mockHelper.EXPECT().GetBranchNetworkInterface(&trunkId, &SubnetId).Return(nil, nil)
 
 	_, err := trunkENI.CreateAndAssociateBranchENIs(MockPod2, SecurityGroups, 1, nil)
