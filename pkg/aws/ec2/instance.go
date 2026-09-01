@@ -101,7 +101,7 @@ type EC2Instance interface {
 	GetCustomNetworkingSpec() (subnetID string, securityGroup []string)
 	UpdateCurrentSubnetAndCidrBlock(helper api.EC2APIHelper) error
 	GetConnectionTrackingSpec() (tcpEstablishedTimeout, udpStreamTimeout, udpTimeout *int32)
-	LoadFromNodeNetworkState(state rcv1alpha1.NodeNetworkState, trunkENIID string)
+	LoadFromNodeNetworkState(state rcv1alpha1.NodeNetworkState, instanceType string, trunkENIID string)
 	BuildNodeNetworkState() rcv1alpha1.NodeNetworkState
 	IsRestoredFromNodeNetworkState() bool
 	RestoredTrunkENIID() string
@@ -396,20 +396,20 @@ func prefixLengthFromCIDR(cidr string) string {
 // from the current ENIConfig. Device indexes and the primary ENI id remain
 // unset because restored nodes already have a trunk, and Windows nodes do not
 // use this restoration path.
-func (i *ec2Instance) LoadFromNodeNetworkState(state rcv1alpha1.NodeNetworkState, trunkENIID string) {
+func (i *ec2Instance) LoadFromNodeNetworkState(state rcv1alpha1.NodeNetworkState, instanceType string, trunkENIID string) {
 	i.lock.Lock()
 	defer i.lock.Unlock()
 
-	i.instanceType = state.InstanceType
-	i.instanceSubnetID = state.InstanceSubnetID
-	i.instanceSubnetCidrBlock = state.InstanceSubnetCIDRBlock
-	i.instanceSubnetV6CidrBlock = state.InstanceSubnetV6CIDRBlock
+	i.instanceType = instanceType
+	i.instanceSubnetID = state.SubnetID
+	i.instanceSubnetCidrBlock = state.SubnetCIDRBlock
+	i.instanceSubnetV6CidrBlock = state.SubnetV6CIDRBlock
 	i.currentSubnetID = ""
 	i.currentSubnetCIDRBlock = ""
 	i.currentSubnetV6CIDRBlock = ""
 	i.currentInstanceSecurityGroups = nil
-	i.subnetMask = prefixLengthFromCIDR(state.InstanceSubnetCIDRBlock)
-	i.subnetV6Mask = prefixLengthFromCIDR(state.InstanceSubnetV6CIDRBlock)
+	i.subnetMask = prefixLengthFromCIDR(state.SubnetCIDRBlock)
+	i.subnetV6Mask = prefixLengthFromCIDR(state.SubnetV6CIDRBlock)
 	i.primaryENISecurityGroups = state.PrimaryNetworkInterfaceSecurityGroups
 	if ct := state.ConnectionTracking; ct != nil {
 		i.tcpEstablishedTimeout = ct.TCPEstablishedTimeout
@@ -431,9 +431,9 @@ func (i *ec2Instance) BuildNodeNetworkState() rcv1alpha1.NodeNetworkState {
 	i.lock.RLock()
 	defer i.lock.RUnlock()
 
-	var connectionTracking *rcv1alpha1.ConnectionTrackingStatus
+	var connectionTracking *rcv1alpha1.ConnectionTrackingConfig
 	if i.tcpEstablishedTimeout != nil || i.udpStreamTimeout != nil || i.udpTimeout != nil {
-		connectionTracking = &rcv1alpha1.ConnectionTrackingStatus{
+		connectionTracking = &rcv1alpha1.ConnectionTrackingConfig{
 			TCPEstablishedTimeout: i.tcpEstablishedTimeout,
 			UDPStreamTimeout:      i.udpStreamTimeout,
 			UDPTimeout:            i.udpTimeout,
@@ -441,10 +441,9 @@ func (i *ec2Instance) BuildNodeNetworkState() rcv1alpha1.NodeNetworkState {
 	}
 	return rcv1alpha1.NodeNetworkState{
 		InstanceID:                            i.instanceID,
-		InstanceType:                          i.instanceType,
-		InstanceSubnetID:                      i.instanceSubnetID,
-		InstanceSubnetCIDRBlock:               i.instanceSubnetCidrBlock,
-		InstanceSubnetV6CIDRBlock:             i.instanceSubnetV6CidrBlock,
+		SubnetID:                              i.instanceSubnetID,
+		SubnetCIDRBlock:                       i.instanceSubnetCidrBlock,
+		SubnetV6CIDRBlock:                     i.instanceSubnetV6CidrBlock,
 		PrimaryNetworkInterfaceSecurityGroups: i.primaryENISecurityGroups,
 		ConnectionTracking:                    connectionTracking,
 	}

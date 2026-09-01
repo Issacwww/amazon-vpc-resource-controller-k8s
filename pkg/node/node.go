@@ -75,7 +75,6 @@ const (
 	restoreReasonInstanceIDMismatch   = "instance_id_mismatch"
 	restoreReasonSubnetMismatch       = "subnet_mismatch"
 	restoreReasonSubnetLookupFailed   = "subnet_lookup_failed"
-	restoreReasonInstanceTypeMismatch = "instance_type_mismatch"
 	restoreReasonUnsupportedType      = "unsupported_type"
 
 	// node_init_duration_seconds label values.
@@ -282,13 +281,12 @@ func validateNodeNetworkState(observed *rcv1alpha1.TrunkInterface, state *rcv1al
 	// IPv6 remains optional because not every subnet has an IPv6 CIDR.
 	switch {
 	case observed == nil, observed.ID == "", state.InstanceID == "",
-		state.InstanceType == "", state.InstanceSubnetID == "",
-		state.InstanceSubnetCIDRBlock == "",
+		state.SubnetID == "", state.SubnetCIDRBlock == "",
 		len(state.PrimaryNetworkInterfaceSecurityGroups) == 0:
 		return restoreReasonMissingField
 	}
 	for _, cidr := range []string{
-		state.InstanceSubnetCIDRBlock, state.InstanceSubnetV6CIDRBlock,
+		state.SubnetCIDRBlock, state.SubnetV6CIDRBlock,
 	} {
 		if cidr == "" {
 			continue
@@ -303,11 +301,12 @@ func validateNodeNetworkState(observed *rcv1alpha1.TrunkInterface, state *rcv1al
 		return restoreReasonInstanceIDMismatch
 	}
 
-	// Instance type determines branch ENI capacity.
-	if nodeInstanceType != "" && nodeInstanceType != state.InstanceType {
-		return restoreReasonInstanceTypeMismatch
+	// Instance type determines branch ENI capacity. It is read from the
+	// Kubernetes Node label and is no longer persisted in the checkpoint.
+	if nodeInstanceType == "" {
+		return restoreReasonMissingField
 	}
-	if _, ok := vpc.Limits[state.InstanceType]; !ok {
+	if _, ok := vpc.Limits[nodeInstanceType]; !ok {
 		return restoreReasonUnsupportedType
 	}
 	return ""
@@ -344,7 +343,7 @@ func (n *node) tryRestoreFromNodeNetworkState() bool {
 	}
 
 	trunkENIID := cniNode.Status.TrunkInterface.ID
-	n.instance.LoadFromNodeNetworkState(*state, trunkENIID)
+	n.instance.LoadFromNodeNetworkState(*state, n.instanceType, trunkENIID)
 	if err := n.instance.UpdateCurrentSubnetAndCidrBlock(n.ec2API); err != nil {
 		n.log.Error(err, "failed to derive network state during restoration")
 		cniNodeNetworkStateRestoreCount.WithLabelValues(restoreResultMiss, restoreReasonSubnetLookupFailed).Inc()
