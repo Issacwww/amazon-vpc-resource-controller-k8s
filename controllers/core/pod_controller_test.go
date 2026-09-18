@@ -28,6 +28,7 @@ import (
 	mock_provider "github.com/aws/amazon-vpc-resource-controller-k8s/mocks/amazon-vcp-resource-controller-k8s/pkg/provider"
 	mock_resource "github.com/aws/amazon-vpc-resource-controller-k8s/mocks/amazon-vcp-resource-controller-k8s/pkg/resource"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/config"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/identity"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/k8s/pod"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
@@ -139,18 +140,49 @@ func TestPodReconciler_Reconcile_Create(t *testing.T) {
 	defer ctrl.Finish()
 
 	mock := NewMock(ctrl, mockPod)
+	currentNode := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: mockNodeName, UID: "node-uid"},
+		Spec:       v1.NodeSpec{ProviderID: "aws:///us-west-2a/i-current"},
+	}
 
 	mock.MockNodeManager.EXPECT().GetNode(mockNodeName).Return(mock.MockNode, true)
-	mock.MockK8sAPI.EXPECT().GetNode(mockNodeName).Return(nil, nil)
+	mock.MockK8sAPI.EXPECT().GetNode(mockNodeName).Return(currentNode, nil)
+	mock.MockNode.EXPECT().GetNodeInstanceID().Return("i-current")
 	mock.MockNode.EXPECT().IsManaged().Return(true)
 	mock.MockNode.EXPECT().IsReady().Return(true)
 	mock.MockResourceManager.EXPECT().GetResourceHandler(mockResourceName).Return(mock.MockHandler, true)
-	mock.MockHandler.EXPECT().HandleCreate(3, gomock.Any()).Return(reconcile.Result{}, nil)
+	mock.MockHandler.EXPECT().HandleCreate(3, gomock.Any(), identity.Allocation{
+		Node: identity.Node{
+			Name:       mockNodeName,
+			UID:        "node-uid",
+			InstanceID: "i-current",
+		},
+		PodUID: mockPod.UID,
+	}).Return(reconcile.Result{}, nil)
 	mock.MockResourceManager.EXPECT().GetResourceHandler(mockUnsupportedResourceName).Return(nil, false)
 
 	result, err := mock.PodReconciler.Reconcile(mockReq)
 	assert.NoError(t, err)
 	assert.Equal(t, result, controllerruntime.Result{})
+}
+
+func TestPodReconciler_Reconcile_CreateWaitsForCurrentNodeGeneration(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mock := NewMock(ctrl, mockPod)
+	currentNode := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: mockNodeName},
+		Spec:       v1.NodeSpec{ProviderID: "aws:///us-west-2c/i-current"},
+	}
+	mock.MockNodeManager.EXPECT().GetNode(mockNodeName).Return(mock.MockNode, true)
+	mock.MockK8sAPI.EXPECT().GetNode(mockNodeName).Return(currentNode, nil)
+	mock.MockNode.EXPECT().GetNodeInstanceID().Return("i-old").Times(2)
+
+	result, err := mock.PodReconciler.Reconcile(mockReq)
+
+	assert.NoError(t, err)
+	assert.Equal(t, PodRequeueRequest, result)
 }
 
 // TestPodReconciler_Reconcile_Delete test that the resource handler is invoked for supported resource type in case of

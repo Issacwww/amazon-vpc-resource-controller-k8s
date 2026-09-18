@@ -16,10 +16,11 @@ rules:
   - ""
   resources:
   - nodes
-  - serviceaccounts
+  - pods
   verbs:
   - get
   - list
+  - patch
   - watch
 - apiGroups:
   - ""
@@ -31,11 +32,10 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - pods
+  - serviceaccounts
   verbs:
   - get
   - list
-  - patch
   - watch
 - apiGroups:
   - crd.k8s.amazonaws.com

@@ -22,7 +22,9 @@ import (
 	"github.com/aws/amazon-vpc-resource-controller-k8s/mocks/amazon-vcp-resource-controller-k8s/pkg/provider"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/api"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/config"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/identity"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/pool"
+	resourceprovider "github.com/aws/amazon-vpc-resource-controller-k8s/pkg/provider"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/worker"
 
 	"github.com/golang/mock/gomock"
@@ -60,6 +62,16 @@ var (
 	job = worker.NewWarmPoolCreateJob(nodeName, 1)
 )
 
+type testPoolLeaseProvider struct {
+	resourceprovider.ResourceProvider
+	resourcePool pool.Pool
+	released     chan struct{}
+}
+
+func (p *testPoolLeaseProvider) AcquirePool(string, identity.Node) (pool.Pool, func(), bool) {
+	return p.resourcePool, func() { close(p.released) }, true
+}
+
 // TestWarmResourceHandler_HandleCreate tests create assigns a resource and annotates the pod and then reconciles a pool
 // and submits the job to the resource provider
 func TestWarmResourceHandler_HandleCreate(t *testing.T) {
@@ -81,6 +93,34 @@ func TestWarmResourceHandler_HandleCreate(t *testing.T) {
 
 	_, err := handler.HandleCreate(1, podCopy)
 	assert.NoError(t, err)
+}
+
+func TestWarmResourceHandler_HandleCreateHoldsPoolLeaseThroughAnnotation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	handler, mockK8sWrapper, mockPodAPI, mockProvider, mockPool := getHandlerAndMocks(ctrl)
+	released := make(chan struct{})
+	handler.resourceProvider = &testPoolLeaseProvider{
+		ResourceProvider: mockProvider,
+		resourcePool:     mockPool,
+		released:         released,
+	}
+	podCopy := pod.DeepCopy()
+	delete(podCopy.Annotations, config.ResourceNameIPAddress)
+
+	mockPool.EXPECT().AssignResource(uid).Return(ipAddress, false, nil)
+	mockPodAPI.EXPECT().AnnotatePod(pod.Namespace, pod.Name, types.UID(uid), resourceName, ipAddress).Return(nil)
+	mockK8sWrapper.EXPECT().BroadcastEvent(podCopy, ReasonResourceAllocated, gomock.Any(), v1.EventTypeNormal)
+
+	_, err := handler.HandleCreate(1, podCopy)
+
+	assert.NoError(t, err)
+	select {
+	case <-released:
+	default:
+		t.Fatal("pool lease was not released after annotation completed")
+	}
 }
 
 func TestWarmResourceHandler_PoolEmpty(t *testing.T) {

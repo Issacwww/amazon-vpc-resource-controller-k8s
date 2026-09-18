@@ -23,6 +23,7 @@ import (
 	rcv1alpha1 "github.com/aws/amazon-vpc-resource-controller-k8s/apis/vpcresources/v1alpha1"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/aws/ec2"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/aws/ec2/api"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/identity"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/k8s"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/provider"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/resource"
@@ -45,6 +46,8 @@ type node struct {
 	// managed status indicates if the node is managed by the controller or not
 	// This field should stay immutable in the lifecycle of node object
 	managed bool
+	// uid identifies the Kubernetes Node generation represented by this object.
+	uid types.UID
 	// instance stores the ec2 instance details that is shared by all the providers
 	instance ec2.EC2Instance
 	// node has reference to k8s APIs
@@ -138,6 +141,10 @@ func (e *ErrInitResources) Error() string {
 	return fmt.Sprintf("%s: %v", e.Message, e.Err)
 }
 
+func (e *ErrInitResources) Unwrap() error {
+	return e.Err
+}
+
 type Node interface {
 	InitResources(resourceManager resource.ResourceManager) error
 	DeleteResources(resourceManager resource.ResourceManager) error
@@ -157,11 +164,29 @@ type Node interface {
 	SetReconciliationInterval(time time.Duration)
 }
 
+type GenerationNode interface {
+	GetNodeUID() types.UID
+}
+
+func GetNodeUID(node Node) types.UID {
+	if generationNode, ok := node.(GenerationNode); ok {
+		return generationNode.GetNodeUID()
+	}
+	return ""
+}
+
 // NewManagedNode returns node managed by the controller
-func NewManagedNode(log logr.Logger, nodeName, instanceID, os string, k8sAPI k8s.K8sWrapper, ec2API api.EC2APIHelper) Node {
+func NewManagedNode(log logr.Logger, nodeName, instanceID, os string, k8sAPI k8s.K8sWrapper,
+	ec2API api.EC2APIHelper, nodeUID ...types.UID,
+) Node {
 	registerNodeMetrics()
+	var uid types.UID
+	if len(nodeUID) > 0 {
+		uid = nodeUID[0]
+	}
 	return &node{
 		managed: true,
+		uid:     uid,
 		log: log.WithName("node resource handler").
 			WithValues("node name", nodeName),
 		instance:               ec2.NewEC2Instance(nodeName, instanceID, os, log.WithName("ec2instance")),
@@ -172,12 +197,17 @@ func NewManagedNode(log logr.Logger, nodeName, instanceID, os string, k8sAPI k8s
 }
 
 // NewUnManagedNode returns a node that's not managed by the controller
-func NewUnManagedNode(log logr.Logger, nodeName, instanceID, os string) Node {
+func NewUnManagedNode(log logr.Logger, nodeName, instanceID, os string, nodeUID ...types.UID) Node {
 	// We should initialize instance for unmanaged node as well
 	// only operate on managed node because unmanaged node has no instance initialized
 	// operating on them could lead to nil pointer dereference
+	var uid types.UID
+	if len(nodeUID) > 0 {
+		uid = nodeUID[0]
+	}
 	return &node{
 		managed: false,
+		uid:     uid,
 		log: log.WithName("node resource handler").
 			WithValues("node name", nodeName),
 		instance: ec2.NewEC2Instance(nodeName, instanceID, os, log.WithName("ec2instance")),
@@ -251,7 +281,15 @@ func (n *node) InitResources(resourceManager resource.ResourceManager) error {
 	for _, resourceProvider := range resourceManager.GetResourceProviders() {
 		// Check if the instance is supported and then initialize the provider
 		if resourceProvider.IsInstanceSupported(n.instance) {
-			errInit = resourceProvider.InitResource(n.instance)
+			if generationProvider, ok := resourceProvider.(provider.NodeGenerationProvider); ok {
+				errInit = generationProvider.InitResourceForNode(n.instance, identity.Node{
+					Name:       n.instance.Name(),
+					UID:        n.uid,
+					InstanceID: n.instance.InstanceID(),
+				})
+			} else {
+				errInit = resourceProvider.InitResource(n.instance)
+			}
 			if errInit != nil {
 				break
 			}
@@ -424,6 +462,13 @@ func (n *node) GetNodeInstanceID() string {
 	defer n.lock.RUnlock()
 
 	return n.instance.InstanceID()
+}
+
+func (n *node) GetNodeUID() types.UID {
+	n.lock.RLock()
+	defer n.lock.RUnlock()
+
+	return n.uid
 }
 
 func (n *node) HasInstance() bool {

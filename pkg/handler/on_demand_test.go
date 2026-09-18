@@ -50,9 +50,11 @@ var (
 
 	createJob = worker.OnDemandJob{
 		Operation:    worker.OperationCreate,
+		UID:          mockUID,
 		PodName:      mockPodName,
 		PodNamespace: mockPodNamespace,
 		RequestCount: 1,
+		NodeName:     mockNodeName,
 	}
 
 	deletedJob = worker.OnDemandJob{

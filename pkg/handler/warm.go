@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/api"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/identity"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/pool"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/provider"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/worker"
@@ -56,11 +57,18 @@ func NewWarmResourceHandler(log logr.Logger, wrapper api.Wrapper,
 	}
 }
 
-func (w *warmResourceHandler) HandleCreate(_ int, pod *v1.Pod) (ctrl.Result, error) {
-	resourcePool, err := w.getResourcePool(pod.Spec.NodeName)
+func (w *warmResourceHandler) HandleCreate(_ int, pod *v1.Pod,
+	allocations ...identity.Allocation,
+) (ctrl.Result, error) {
+	var allocation identity.Allocation
+	if len(allocations) > 0 {
+		allocation = allocations[0]
+	}
+	resourcePool, release, err := w.acquireResourcePool(pod.Spec.NodeName, allocation.Node)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	defer release()
 	if _, present := pod.Annotations[w.resourceName]; present {
 		// Pod has already been allocated the resource, skip the event
 		return ctrl.Result{}, nil
@@ -141,12 +149,13 @@ func (w *warmResourceHandler) reconcilePool(shouldReconcile bool, resourcePool p
 
 // HandleDelete deletes the resource used by the pod
 func (w *warmResourceHandler) HandleDelete(pod *v1.Pod) (ctrl.Result, error) {
-	resourcePool, err := w.getResourcePool(pod.Spec.NodeName)
+	resourcePool, release, err := w.acquireResourcePool(pod.Spec.NodeName, identity.Node{})
 	if err != nil {
 		w.log.Error(err, "failed to find resource pool for node",
 			"node", pod.Spec.NodeName)
 		return ctrl.Result{}, nil
 	}
+	defer release()
 	resourceID, present := pod.Annotations[w.resourceName]
 	if !present {
 		// When a Pod with TerminationGracePeriodSeconds set to 0 is created and
@@ -191,4 +200,23 @@ func (w *warmResourceHandler) getResourcePool(nodeName string) (pool.Pool, error
 	}
 
 	return resourcePool, nil
+}
+
+func (w *warmResourceHandler) acquireResourcePool(nodeName string,
+	expected identity.Node,
+) (pool.Pool, func(), error) {
+	if leaseProvider, ok := w.resourceProvider.(provider.PoolLeaseProvider); ok {
+		resourcePool, release, found := leaseProvider.AcquirePool(nodeName, expected)
+		if !found {
+			return nil, nil, fmt.Errorf("failed to find the resource pool %s for node %s",
+				w.resourceName, nodeName)
+		}
+		return resourcePool, release, nil
+	}
+
+	resourcePool, err := w.getResourcePool(nodeName)
+	if err != nil {
+		return nil, nil, err
+	}
+	return resourcePool, func() {}, nil
 }

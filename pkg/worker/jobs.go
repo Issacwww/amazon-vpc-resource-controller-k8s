@@ -13,7 +13,10 @@
 
 package worker
 
-import "k8s.io/apimachinery/pkg/types"
+import (
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/identity"
+	"k8s.io/apimachinery/pkg/types"
+)
 
 // Operations are the supported operations for on demand resource handler
 type Operations string
@@ -50,15 +53,34 @@ type OnDemandJob struct {
 	RequestCount int
 	// NodeName is the k8s node name
 	NodeName string
+	// NodeUID identifies the Kubernetes Node generation validated for a Pod
+	// allocation.
+	NodeUID types.UID
+	// InstanceID identifies the node generation for operations that can run
+	// after a same-name Node has been created.
+	InstanceID string
+	// Generation identifies the exact provider-cache installation. Instance ID
+	// alone cannot distinguish two lifecycles of the same EC2 instance.
+	Generation string
 }
 
 // NewOnDemandDeleteJob returns an on demand job for operation Create or Update
-func NewOnDemandCreateJob(podNamespace string, podName string, requestCount int) OnDemandJob {
+func NewOnDemandCreateJob(podNamespace, podName string, requestCount int,
+	allocations ...identity.Allocation,
+) OnDemandJob {
+	var allocation identity.Allocation
+	if len(allocations) > 0 {
+		allocation = allocations[0]
+	}
 	return OnDemandJob{
 		Operation:    OperationCreate,
+		UID:          string(allocation.PodUID),
 		PodNamespace: podNamespace,
 		PodName:      podName,
 		RequestCount: requestCount,
+		NodeName:     allocation.Name,
+		NodeUID:      allocation.UID,
+		InstanceID:   allocation.InstanceID,
 	}
 }
 
@@ -88,10 +110,12 @@ func NewOnDemandProcessDeleteQueueJob(nodeName string) OnDemandJob {
 }
 
 // NewOnDemandDeleteNodeJob returns a delete node job
-func NewOnDemandDeleteNodeJob(nodeName string) OnDemandJob {
+func NewOnDemandDeleteNodeJob(nodeName, instanceID, generation string) OnDemandJob {
 	return OnDemandJob{
-		Operation: OperationDeleteNode,
-		NodeName:  nodeName,
+		Operation:  OperationDeleteNode,
+		NodeName:   nodeName,
+		InstanceID: instanceID,
+		Generation: generation,
 	}
 }
 
@@ -105,37 +129,52 @@ type WarmPoolJob struct {
 	ResourceCount int
 	// NodeName is the name of the node
 	NodeName string
+	// Generation identifies the exact provider cache and pool that produced the
+	// job. It prevents delayed jobs from an old same-name Node lifecycle from
+	// mutating a replacement pool.
+	Generation string
 }
 
 // NewWarmPoolCreateJob returns a job on warm pool of resource
-func NewWarmPoolCreateJob(nodeName string, count int) *WarmPoolJob {
+func NewWarmPoolCreateJob(nodeName string, count int, generation ...string) *WarmPoolJob {
 	return &WarmPoolJob{
 		Operations:    OperationCreate,
 		NodeName:      nodeName,
 		ResourceCount: count,
+		Generation:    warmPoolGeneration(generation),
 	}
 }
 
 // NewWarmPoolReSyncJob returns a job to re-sync the warm pool with upstream
-func NewWarmPoolReSyncJob(nodeName string) *WarmPoolJob {
+func NewWarmPoolReSyncJob(nodeName string, generation ...string) *WarmPoolJob {
 	return &WarmPoolJob{
 		Operations: OperationReSyncPool,
 		NodeName:   nodeName,
+		Generation: warmPoolGeneration(generation),
 	}
 }
 
-func NewWarmPoolDeleteJob(nodeName string, resourcesToDelete []string) *WarmPoolJob {
+func NewWarmPoolDeleteJob(nodeName string, resourcesToDelete []string, generation ...string) *WarmPoolJob {
 	return &WarmPoolJob{
 		Operations:    OperationDeleted,
 		NodeName:      nodeName,
 		Resources:     resourcesToDelete,
 		ResourceCount: len(resourcesToDelete),
+		Generation:    warmPoolGeneration(generation),
 	}
 }
 
-func NewWarmProcessDeleteQueueJob(nodeName string) *WarmPoolJob {
+func NewWarmProcessDeleteQueueJob(nodeName string, generation ...string) *WarmPoolJob {
 	return &WarmPoolJob{
 		Operations: OperationProcessDeleteQueue,
 		NodeName:   nodeName,
+		Generation: warmPoolGeneration(generation),
 	}
+}
+
+func warmPoolGeneration(generation []string) string {
+	if len(generation) == 0 {
+		return ""
+	}
+	return generation[0]
 }

@@ -74,6 +74,8 @@ type pool struct {
 	pendingDelete int
 	// nodeName k8s name of the node
 	nodeName string
+	// generation identifies the provider cache installation that owns the pool.
+	generation string
 	// reSyncRequired is set if the upstream and pool are possibly out of sync due to
 	// errors in creating/deleting resources
 	reSyncRequired bool
@@ -112,7 +114,7 @@ type IntrospectSummaryResponse struct {
 }
 
 func NewResourcePool(log logr.Logger, poolConfig *config.WarmPoolConfig, usedResources map[string]Resource,
-	warmResources map[string][]Resource, nodeName string, capacity int, isPDPool bool) Pool {
+	warmResources map[string][]Resource, nodeName string, capacity int, isPDPool bool, generation ...string) Pool {
 	pool := &pool{
 		log:            log,
 		warmPoolConfig: poolConfig,
@@ -121,6 +123,9 @@ func NewResourcePool(log logr.Logger, poolConfig *config.WarmPoolConfig, usedRes
 		capacity:       capacity,
 		nodeName:       nodeName,
 		isPDPool:       isPDPool,
+	}
+	if len(generation) > 0 {
+		pool.generation = generation[0]
 	}
 	return pool
 }
@@ -434,7 +439,7 @@ func (p *pool) ReconcilePool() *worker.WarmPoolJob {
 			}
 		}
 		p.log.Info("submitting request re-sync the pool")
-		return worker.NewWarmPoolReSyncJob(p.nodeName)
+		return worker.NewWarmPoolReSyncJob(p.nodeName, p.generation)
 	}
 
 	if len(p.usedResources)+p.pendingCreate+p.pendingDelete+len(p.coolDownQueue) == p.capacity {
@@ -475,9 +480,9 @@ func (p *pool) ReconcilePool() *worker.WarmPoolJob {
 		log.Info("created job to add resources to warm pool", "pendingCreate", p.pendingCreate,
 			"requested count", deviation)
 		if p.isPDPool {
-			return worker.NewWarmPoolCreateJob(p.nodeName, deviation/NumIPv4AddrPerPrefix)
+			return worker.NewWarmPoolCreateJob(p.nodeName, deviation/NumIPv4AddrPerPrefix, p.generation)
 		}
-		return worker.NewWarmPoolCreateJob(p.nodeName, deviation)
+		return worker.NewWarmPoolCreateJob(p.nodeName, deviation, p.generation)
 
 	} else if -deviation > p.warmPoolConfig.MaxDeviation {
 		// Need to delete from warm pool
@@ -518,7 +523,7 @@ func (p *pool) ReconcilePool() *worker.WarmPoolJob {
 			// Submit the job to delete resources
 			log.Info("created job to delete resources from warm pool", "pendingDelete", p.pendingDelete,
 				"resources to delete", resourceToDelete)
-			return worker.NewWarmPoolDeleteJob(p.nodeName, resourceToDelete)
+			return worker.NewWarmPoolDeleteJob(p.nodeName, resourceToDelete, p.generation)
 		}
 	}
 

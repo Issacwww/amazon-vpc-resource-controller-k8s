@@ -27,6 +27,7 @@ var (
 	UID          = types.UID(podUid)
 	reqCount     = 2
 	nodeName     = "node-name"
+	instanceID   = "i-0123456789abcdef0"
 )
 
 // TestNewOnDemandCreateJob tests the fields of Create Job
@@ -61,27 +62,52 @@ func TestNewOnDemandProcessDeleteQueueJob(t *testing.T) {
 	assert.Equal(t, nodeName, onDemandJob.NodeName)
 }
 
+func TestNewOnDemandDeleteNodeJob(t *testing.T) {
+	generation := "cache-generation"
+	onDemandJob := NewOnDemandDeleteNodeJob(nodeName, instanceID, generation)
+
+	assert.Equal(t, OperationDeleteNode, onDemandJob.Operation)
+	assert.Equal(t, nodeName, onDemandJob.NodeName)
+	assert.Equal(t, instanceID, onDemandJob.InstanceID)
+	assert.Equal(t, generation, onDemandJob.Generation)
+}
+
 func TestNewWarmPoolCreateJob(t *testing.T) {
-	warmPoolJob := NewWarmPoolCreateJob(nodeName, 2)
+	generation := "provider-generation"
+	warmPoolJob := NewWarmPoolCreateJob(nodeName, 2, generation)
 
 	assert.Equal(t, OperationCreate, warmPoolJob.Operations)
 	assert.Equal(t, 2, warmPoolJob.ResourceCount)
 	assert.Equal(t, nodeName, warmPoolJob.NodeName)
+	assert.Equal(t, generation, warmPoolJob.Generation)
 }
 
 func TestNewWarmPoolDeleteJob(t *testing.T) {
 	resources := []string{"res-1", "res-2"}
-	WarmPoolJob := NewWarmPoolDeleteJob(nodeName, resources)
+	generation := "provider-generation"
+	WarmPoolJob := NewWarmPoolDeleteJob(nodeName, resources, generation)
 
 	assert.Equal(t, OperationDeleted, WarmPoolJob.Operations)
 	assert.Equal(t, nodeName, WarmPoolJob.NodeName)
 	assert.Equal(t, resources, WarmPoolJob.Resources)
 	assert.Equal(t, len(resources), WarmPoolJob.ResourceCount)
+	assert.Equal(t, generation, WarmPoolJob.Generation)
 }
 
 func TestNewWarmPoolReSyncJob(t *testing.T) {
-	WarmPoolJob := NewWarmPoolReSyncJob(nodeName)
+	generation := "provider-generation"
+	WarmPoolJob := NewWarmPoolReSyncJob(nodeName, generation)
 
 	assert.Equal(t, OperationReSyncPool, WarmPoolJob.Operations)
 	assert.Equal(t, nodeName, WarmPoolJob.NodeName)
+	assert.Equal(t, generation, WarmPoolJob.Generation)
+}
+
+func TestNewWarmProcessDeleteQueueJob(t *testing.T) {
+	generation := "provider-generation"
+	job := NewWarmProcessDeleteQueueJob(nodeName, generation)
+
+	assert.Equal(t, OperationProcessDeleteQueue, job.Operations)
+	assert.Equal(t, nodeName, job.NodeName)
+	assert.Equal(t, generation, job.Generation)
 }

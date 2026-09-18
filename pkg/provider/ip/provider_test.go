@@ -18,6 +18,7 @@ import (
 	"reflect"
 	"strconv"
 	"testing"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 
@@ -29,6 +30,7 @@ import (
 	mock_worker "github.com/aws/amazon-vpc-resource-controller-k8s/mocks/amazon-vcp-resource-controller-k8s/pkg/worker"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/api"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/config"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/identity"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/pool"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/provider/ip/eni"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/worker"
@@ -321,6 +323,83 @@ func TestIPv4Provider_SubmitAsyncJob(t *testing.T) {
 	ipv4Provider.SubmitAsyncJob(job)
 }
 
+func TestIPv4Provider_IgnoresJobFromPreviousGeneration(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	provider := getMockIpProvider()
+	mockPool := mock_pool.NewMockPool(ctrl)
+	mockManager := mock_eni.NewMockENIManager(ctrl)
+	provider.putInstanceProviderAndPool(
+		nodeName, mockPool, mockManager, nodeCapacity, false, "current-generation")
+
+	result, err := provider.ProcessAsyncJob(&worker.WarmPoolJob{
+		Operations: worker.OperationCreate,
+		NodeName:   nodeName,
+		Generation: "old-generation",
+	})
+
+	assert.NoError(t, err)
+	assert.Empty(t, result)
+}
+
+func TestIPv4Provider_ReplacementWaitsForRunningOldGenerationJob(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	provider := getMockIpProvider()
+	oldPool := mock_pool.NewMockPool(ctrl)
+	oldManager := mock_eni.NewMockENIManager(ctrl)
+	newPool := mock_pool.NewMockPool(ctrl)
+	newManager := mock_eni.NewMockENIManager(ctrl)
+	provider.putInstanceProviderAndPool(
+		nodeName, oldPool, oldManager, nodeCapacity, false, "old-generation")
+
+	jobStarted := make(chan struct{})
+	releaseJob := make(chan struct{})
+	oldManager.EXPECT().CreateIPV4Resource(
+		1, config.ResourceTypeIPv4Address, nil, gomock.Any(),
+	).DoAndReturn(func(int, config.ResourceType, interface{}, interface{}) ([]string, error) {
+		close(jobStarted)
+		<-releaseJob
+		return []string{ip1}, nil
+	})
+	oldPool.EXPECT().UpdatePool(gomock.Any(), true, false).Return(false)
+
+	jobDone := make(chan struct{})
+	go func() {
+		defer close(jobDone)
+		_, _ = provider.ProcessAsyncJob(&worker.WarmPoolJob{
+			Operations:    worker.OperationCreate,
+			NodeName:      nodeName,
+			ResourceCount: 1,
+			Generation:    "old-generation",
+		})
+	}()
+	<-jobStarted
+
+	replacementDone := make(chan struct{})
+	go func() {
+		defer close(replacementDone)
+		provider.putInstanceProviderAndPool(
+			nodeName, newPool, newManager, nodeCapacity, false, "new-generation")
+	}()
+
+	select {
+	case <-replacementDone:
+		t.Fatal("provider generation was replaced while an old job was still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseJob)
+	<-jobDone
+	<-replacementDone
+
+	current, found := provider.getInstanceProviderAndPool(nodeName)
+	assert.True(t, found)
+	assert.Equal(t, "new-generation", current.generation)
+	assert.Equal(t, newPool, current.resourcePool)
+}
+
 // TestIPv4Provider_UpdateResourceCapacity_FromFromPDToIP tests the warm pool is set to active when secondary IP mode is enabled and
 // resource capacity is updated by calling the k8s wrapper
 func TestIPv4Provider_UpdateResourceCapacity_FromFromPDToIP(t *testing.T) {
@@ -507,6 +586,55 @@ func TestIpv4Provider_GetPool(t *testing.T) {
 	pool, found := ipv4Provider.GetPool(nodeName)
 	assert.True(t, found)
 	assert.Equal(t, mockPool, pool)
+}
+
+func TestIpv4Provider_AcquirePoolBlocksGenerationDeletion(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ipv4Provider := getMockIpProvider()
+	mockPool := mock_pool.NewMockPool(ctrl)
+	ipv4Provider.putInstanceProviderAndPool(nodeName, mockPool, nil, nodeCapacity, false)
+
+	acquiredPool, release, found := ipv4Provider.AcquirePool(nodeName, identity.Node{})
+	assert.True(t, found)
+	assert.Equal(t, mockPool, acquiredPool)
+
+	deleted := make(chan struct{})
+	go func() {
+		ipv4Provider.deleteInstanceProviderAndPool(nodeName)
+		close(deleted)
+	}()
+
+	select {
+	case <-deleted:
+		t.Fatal("provider generation was deleted while a synchronous pool operation held a lease")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	release()
+	<-deleted
+	_, found = ipv4Provider.GetPool(nodeName)
+	assert.False(t, found)
+}
+
+func TestIpv4Provider_AcquirePoolRejectsDifferentNodeUID(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ipv4Provider := getMockIpProvider()
+	mockPool := mock_pool.NewMockPool(ctrl)
+	ipv4Provider.putInstanceProviderAndPoolForGeneration(
+		nodeName, mockPool, nil, nodeCapacity, false,
+		resourceGeneration{identity: identity.Node{
+			Name: nodeName, UID: "node-b", InstanceID: "i-reused",
+		}})
+
+	_, _, found := ipv4Provider.AcquirePool(nodeName, identity.Node{
+		Name: nodeName, UID: "node-c", InstanceID: "i-reused",
+	})
+
+	assert.False(t, found)
 }
 
 func TestIpv4Provider_Introspect(t *testing.T) {

@@ -28,6 +28,7 @@ import (
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/aws/vpc"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/config"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/provider/branch/cooldown"
+	"github.com/google/uuid"
 	"github.com/samber/lo"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -131,6 +132,19 @@ type TrunkENI interface {
 	TrunkENIID() string
 	// TrunkSubnetID returns the subnet observed on the trunk ENI.
 	TrunkSubnetID() string
+	// InstanceID returns the EC2 instance generation that owns the trunk.
+	InstanceID() string
+	// CacheGeneration identifies this installation of the trunk in provider cache.
+	CacheGeneration() string
+	// AcquireLifecycleUse prevents provider replacement or removal until a
+	// synchronous operation using this trunk has completed.
+	AcquireLifecycleUse() func()
+	// AcquireLifecycleMutation waits for synchronous users before provider
+	// replacement or removal changes this trunk generation.
+	AcquireLifecycleMutation() func()
+	// AdoptInstance refreshes instance-scoped desired state while preserving the
+	// branch ledger for a new Kubernetes Node lifecycle on the same EC2 instance.
+	AdoptInstance(instance ec2.EC2Instance) string
 	// Introspect returns the state of the Trunk ENI
 	Introspect() IntrospectResponse
 }
@@ -164,9 +178,25 @@ type trunkENI struct {
 	// branchStateGate blocks allocation and local branch-state mutation while a
 	// restored trunk is being verified against EC2.
 	branchStateGate sync.RWMutex
+	// lifecycleGate prevents provider generation replacement or removal while a
+	// synchronous Pod allocation still uses this trunk.
+	lifecycleGate sync.RWMutex
 	// branchStateVerified is false only for trunks restored from CNINode until
 	// their complete branch inventory has been recovered from EC2.
 	branchStateVerified bool
+	// cacheGeneration prevents delayed cleanup from a previous node lifecycle
+	// from removing a trunk adopted by a later lifecycle on the same instance.
+	cacheGeneration string
+}
+
+func (t *trunkENI) AcquireLifecycleUse() func() {
+	t.lifecycleGate.RLock()
+	return t.lifecycleGate.RUnlock
+}
+
+func (t *trunkENI) AcquireLifecycleMutation() func() {
+	t.lifecycleGate.Lock()
+	return t.lifecycleGate.Unlock
 }
 
 // getConnectionTrackingSpec builds a ConnectionTrackingSpecificationRequest from the
@@ -238,6 +268,7 @@ func NewTrunkENI(logger logr.Logger, instance ec2.EC2Instance, helper api.EC2API
 		usedVlanIds:       availVlans,
 		ec2ApiHelper:      helper,
 		instance:          instance,
+		cacheGeneration:   uuid.NewString(),
 		uidToBranchENIMap: make(map[string][]*ENIDetails),
 		nodeIDTag: []ec2types.Tag{
 			{
@@ -714,14 +745,39 @@ func (t *trunkENI) TrunkENIID() string {
 // TrunkSubnetID returns the subnet observed on the trunk ENI.
 func (t *trunkENI) TrunkSubnetID() string {
 	t.lock.RLock()
-	trunkSubnetID := t.trunkSubnetID
-	t.lock.RUnlock()
-	if trunkSubnetID != "" {
-		return trunkSubnetID
+	defer t.lock.RUnlock()
+	if t.trunkSubnetID != "" {
+		return t.trunkSubnetID
 	}
 	// The zero-EC2 restore path knows the instance subnet but has not described
 	// the trunk itself. Branch ENIs use that same subnet for discovery.
 	return t.instance.SubnetID()
+}
+
+func (t *trunkENI) InstanceID() string {
+	t.lock.RLock()
+	defer t.lock.RUnlock()
+	return t.instance.InstanceID()
+}
+
+func (t *trunkENI) CacheGeneration() string {
+	t.lock.RLock()
+	defer t.lock.RUnlock()
+	return t.cacheGeneration
+}
+
+func (t *trunkENI) AdoptInstance(instance ec2.EC2Instance) string {
+	t.branchStateGate.Lock()
+	defer t.branchStateGate.Unlock()
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	t.instance = instance
+	t.nodeIDTag = []ec2types.Tag{{
+		Key:   aws.String(config.NetworkInterfaceNodeIDKey),
+		Value: aws.String(instance.InstanceID()),
+	}}
+	t.cacheGeneration = uuid.NewString()
+	return t.cacheGeneration
 }
 
 // Reconcile reconciles the state from the API Server to the internal cache of EC2 Branch Interfaces, if the controller

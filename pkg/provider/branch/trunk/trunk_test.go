@@ -309,6 +309,27 @@ func TestNewTrunkENI(t *testing.T) {
 	assert.NotNil(t, trunkENI)
 }
 
+func TestTrunkENI_AdoptInstanceRefreshesInstanceStateAndPreservesLedger(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	oldInstance := mock_ec2.NewMockEC2Instance(ctrl)
+	newInstance := mock_ec2.NewMockEC2Instance(ctrl)
+	oldInstance.EXPECT().InstanceID().Return(InstanceId)
+	newInstance.EXPECT().InstanceID().Return(InstanceId).AnyTimes()
+	newInstance.EXPECT().SubnetID().Return("subnet-current")
+	trunk := NewTrunkENI(zap.New(), oldInstance, nil).(*trunkENI)
+	trunk.uidToBranchENIMap["pod-uid"] = []*ENIDetails{{ID: "eni-branch"}}
+	oldGeneration := trunk.CacheGeneration()
+
+	newGeneration := trunk.AdoptInstance(newInstance)
+
+	assert.NotEqual(t, oldGeneration, newGeneration)
+	assert.Equal(t, "subnet-current", trunk.TrunkSubnetID())
+	assert.Equal(t, InstanceId, trunk.InstanceID())
+	assert.Equal(t, "eni-branch", trunk.uidToBranchENIMap["pod-uid"][0].ID)
+	assert.Equal(t, InstanceId, aws.ToString(trunk.nodeIDTag[0].Value))
+}
+
 func TestTrunkENI_CreateAndAssociateBranchENIs_QueuesFailedENI(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()

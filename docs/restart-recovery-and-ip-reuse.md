@@ -150,19 +150,59 @@ cover both controller states.
 When a current Node has the same name as an old Node, the old CNINode cannot be
 used as the current Node's dependency.
 
-The Issue 515 protocol must:
+The Issue 515 protocol is:
 
 1. identify the CNINode generation by owner Node UID;
-2. delete an active stale CNINode with a UID precondition;
-3. create or reconcile a successor owned by the current Node UID;
-4. preserve authoritative desired features;
-5. never copy old instance-specific runtime status into the successor.
+2. read Node/CNINode identity through the uncached API reader;
+3. persist the current Node UID and old desired CNINode spec in a dedicated
+   checkpoint CNINode before deleting the old object; mirror it in a Node
+   annotation for the common path. The checkpoint also records the source
+   CNINode UID as the replacement transaction identity;
+4. delete an active stale CNINode with UID and resource-version preconditions;
+5. wait while the old object is deleting;
+6. recreate a successor owned by the current Node UID from the persisted
+   checkpoint;
+7. preserve authoritative desired features;
+8. never copy old instance-specific runtime status into the successor;
+9. clear the annotation after the current-owner successor exists;
+10. allow `AddNode` only after the current-owner successor exists.
+
+The successor is the replacement CNINode for the current Kubernetes Node
+generation. Readiness is based on its owner Node UID, not on status instance ID:
+the successor intentionally starts with empty runtime status, which normal Node
+initialization fills.
+
+The checkpoint CNINode is not owned by a Node generation, so it survives both a
+controller restart and another real delete/create rollover of the same-name
+Node. If the old canonical CNINode and its Node annotation disappear,
+NodeController can still recreate the successor without losing
+`spec.features`. The Node annotation is only a local mirror for the common
+path; it is written only during CNINode generation replacement.
+
+Checkpoint clearing is conditional on the source CNINode UID and deletes the
+durable record with UID/resource-version preconditions. Completion of an older
+replacement cannot clear a newer replacement checkpoint. The Node annotation
+is retained until durable-record cleanup succeeds, so cleanup failures remain
+retryable. If the Kubernetes Node UID changes again while replacement is in
+progress, NodeController moves the same checkpoint to the latest generation
+before creating the successor.
+
+A terminating Node is never treated as the successor generation. Its CNINode
+follows normal finalization; replacement is attempted only for a non-terminating
+current Node.
+
+If the old Node and CNINode have already fully finalized before any same-name
+Node exists, there is no stale generation transition left for Issue 515. The
+later Node follows the existing new-Node CNINode creation path; reconstruction
+of desired feature fields in that path remains the responsibility of their
+field owner.
 
 ### 5.2 Restart path
 
 After controller restart, NodeManager and provider caches are empty. Once the
 current-owner CNINode exists, the normal `AddNode` path can initialize the
-current instance and write fresh status.
+current instance and write fresh status. If the persisted CNINode belongs to an
+old Node UID, the same delete/successor gate runs before `AddNode`.
 
 ### 5.3 Non-restart path
 
@@ -175,19 +215,76 @@ NodeManager      = old instance still cached
 Provider cache   = old trunk may still be present
 ```
 
-Issue 515 must define a generation-aware handoff before initializing the
-current Node. At minimum:
+The generation-aware handoff is:
 
-- a cached instance mismatch must never enter `UpdateNode`;
-- the old manager/provider generation must be removed before current `AddNode`;
-- asynchronous cleanup must carry the old instance or trunk identity;
-- an old cleanup job must no-op if the cache now belongs to a newer generation.
+```text
+cached instance mismatch
+    -> DeleteNode(old generation)
+    -> fence old manager jobs with a lifecycle token
+    -> keep AddNode blocked while provider de-initialization has not succeeded
+    -> AddNode(current generation)
+    -> retry current Init while the old trunk is retained for Pod eviction
+    -> adopt a same-instance trunk with a new provider-cache token
+    -> old delayed cleanup removes only its matching instance and cache token
+    -> current Init installs the current trunk and marks the Node ready
+```
+
+The manager delete job retries every 30 seconds if provider de-initialization
+fails. These timed retries are not subject to the worker's finite error retry
+limit. The current Init job similarly retries while the previous trunk
+generation remains in cache, so convergence does not depend on another
+Kubernetes Node event.
+
+NodeController compares both Kubernetes Node UID and EC2 instance ID. It does
+not call `UpdateNode` for a cached generation with a different UID, including
+when the same EC2 instance ID is reused, or while current-generation
+initialization is pending.
+
+PodController reads the current Kubernetes Node through the uncached API reader
+and compares its instance ID with the cached manager Node before any create
+allocation. It passes the validated Pod UID and Node name/UID/instance ID
+through the handler and queued job. Provider acquisition must match that exact
+identity, so a request validated for generation B cannot allocate from
+generation C even when the EC2 instance ID is reused.
 
 The handoff waits for local ownership of the cache, not for every old EC2
 resource to finish deleting.
 
-The exact manager/provider interface belongs in the Issue 515 design and must
-be validated with rapid same-name Node replacement tests before merge.
+Every manager Init/Update/Delete job carries a lifecycle token. An Init queued
+for an old token is skipped. If an old Init was already running and finishes
+after the generation changed, it schedules provider cleanup instead of marking
+the current Node ready.
+
+The manager counts running Init and cleanup operations for each lifecycle.
+`AddNode` remains blocked until all old Init operations have exited and at least
+one cleanup after the final old Init has succeeded. A late retry for a completed
+generation is skipped before it can call a provider.
+
+Every delayed branch cleanup job carries both the old instance ID and the
+provider-cache token. It removes the cached trunk only when both still match.
+This also protects a managed-to-unmanaged-to-managed transition on the same EC2
+instance, where instance ID alone cannot distinguish the two lifecycles.
+Same-instance token renewal and cache lookup happen under the provider cache
+lock, so adoption cannot race removal by an old delayed job.
+
+Windows secondary-IP and prefix warm-pool jobs carry the provider-cache token
+that created them. A stale queued job is dropped before EC2 or pool mutation.
+Provider cache removal or replacement waits for a job that already acquired the
+old generation, so an in-flight old job cannot cross into the replacement pool.
+Synchronous Pod allocation and release hold the same generation lease through
+pool mutation and Pod annotation.
+
+Branch allocation holds a per-trunk lifecycle lease through recovery, EC2
+association and Pod annotation. Same-instance adoption and delayed trunk removal
+take the exclusive side of that lease, so they wait for a running allocation
+without serializing unrelated Nodes.
+
+Provider de-initialization failures increment
+`node_generation_cleanup_retry_total`; the current number of manager
+generation barriers is exposed as `node_generation_cleanup_pending`. A current
+Init waiting for an old provider generation also increments the retry counter,
+so a trunk that never leaves provider cache remains observable after the
+manager barrier has completed.
 
 ## 6. Change ownership
 
@@ -208,9 +305,13 @@ be validated with rapid same-name Node replacement tests before merge.
 ### Issue 515 owns
 
 - NodeController stale-CNINode deletion.
+- Durable, generation-independent CNINode replacement checkpoint, with a Node
+  annotation mirror.
 - CNINodeController current-owner replacement.
-- Cached Node/provider generation replacement.
-- Instance-aware delayed cleanup jobs.
+- Manager lifecycle fencing and cleanup barrier.
+- Instance-and-cache-generation-aware delayed cleanup jobs.
+- Generation-aware Windows secondary-IP and prefix warm-pool jobs.
+- Synchronous warm-pool and Branch allocation generation leases.
 
 ### Neither change owns
 
@@ -231,10 +332,25 @@ be validated with rapid same-name Node replacement tests before merge.
 ### Issue 515
 
 1. Stale CNINode deletion uses a UID precondition.
-2. The successor belongs to the current Node UID.
-3. Old runtime status is not copied.
-4. A cached instance-ID mismatch never enters `UpdateNode`.
-5. Old asynchronous cleanup cannot mutate the current generation.
+2. The same deletion is fenced by the CNINode resource version whose spec was
+   checkpointed.
+3. Desired spec survives a restart in the CNINode delete/create gap.
+4. Desired spec also survives another real Node UID rollover in that gap.
+5. The successor belongs to a non-terminating current Node controller owner.
+6. Old runtime status is not copied.
+7. A cached instance-ID mismatch never enters `UpdateNode`.
+8. A stale Init cannot install or mark ready an old generation.
+9. A late old Delete cannot call a provider after its generation barrier closes.
+10. `AddNode` remains blocked until running old Init and provider
+   de-initialization have converged.
+11. Current initialization remains retryable while the old trunk handles Pod
+   eviction.
+12. Old asynchronous cleanup cannot mutate the current generation, including
+    when the EC2 instance ID is reused by another local lifecycle.
+13. Pod creation cannot allocate from a manager/provider cache whose Node UID or
+    instance ID differs from the generation validated by PodController.
+14. Provider generation replacement or removal waits for synchronous allocation
+    and its Pod annotation to finish.
 
 ## 8. Validation
 
@@ -246,10 +362,26 @@ be validated with rapid same-name Node replacement tests before merge.
 | EC2 or pagination failure | Flag stays false; no VLAN is allocated |
 | Transitional Branch ENI | Its VLAN is reserved before allocation |
 | Branch ENI in an old custom subnet | Found because recovery has no subnet filter |
-
-Issue 515 has a separate test matrix covering restart and non-restart
-same-name Node replacement, successor creation, cache handoff and delayed-job
-fencing.
+| Restart with stale CNINode owner | UID-precondition delete; wait for current-owner successor |
+| Cached Node lags checkpoint write | Uncached read finds checkpoint; `AddNode` does not create a minimal CNINode |
+| Restart in CNINode delete/create gap | Successor recreated from Node annotation; desired features retained |
+| Another Node UID rollover in that gap | Successor recreated from durable checkpoint CNINode |
+| CNINode spec changes before delete | Resource-version conflict; checkpoint refreshes before retry |
+| Successor creation | Desired features retained; old runtime status empty |
+| Same-name Node is terminating | No successor is created for the terminating UID |
+| Live manager instance mismatch | Delete old generation; never call `UpdateNode` |
+| Same instance ID, different Node UID | Delete old manager generation; reinitialize current generation |
+| Pod create before NodeController handles mismatch | Requeue before any allocation |
+| Provider de-init failure | 30-second timed retry; `AddNode` remains blocked |
+| Old Init finishes after generation change | Old resources are de-initialized; current cache is unchanged |
+| Old Delete retries after barrier completion | Retry is skipped before provider calls |
+| Old trunk retained for Pod eviction | Current Init retries until old trunk leaves |
+| Late old branch cleanup | No-op against a newer instance or provider-cache generation |
+| Same-instance adoption races delayed cleanup | Per-trunk lifecycle lease serializes token renewal and removal |
+| Delayed trunk cleanup races Branch allocation | Cleanup waits through EC2 association and Pod annotation |
+| Old Windows IP/prefix warm-pool job | No EC2 or replacement-pool mutation |
+| Provider replacement during a running warm-pool job | Replacement waits for the old job to exit |
+| Provider replacement during synchronous warm-pool allocation | Replacement waits through Pod annotation |
 
 ## 9. Decisions requested
 

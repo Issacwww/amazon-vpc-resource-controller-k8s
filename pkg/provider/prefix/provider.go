@@ -26,12 +26,14 @@ import (
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/condition"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/config"
 	rcHealthz "github.com/aws/amazon-vpc-resource-controller-k8s/pkg/healthz"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/identity"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/pool"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/provider"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/provider/ip"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/provider/ip/eni"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/worker"
+	"github.com/google/uuid"
 
 	"github.com/go-logr/logr"
 	v1 "k8s.io/api/core/v1"
@@ -60,14 +62,22 @@ type ipv4PrefixProvider struct {
 
 // ResourceProviderAndPool contains the instance's ENI manager and the resource pool
 type ResourceProviderAndPool struct {
-	// lock guards the struct
+	// lock prevents replacement or deletion while an asynchronous job is using
+	// this provider generation.
 	lock         sync.RWMutex
 	eniManager   eni.ENIManager
 	resourcePool pool.Pool
+	generation   string
+	identity     identity.Node
 	// capacity is stored so that it can be advertised when node is updated
 	capacity int
 	// isPrevPDEnabled stores whether PD was enabled previously
 	isPrevPDEnabled bool
+}
+
+type resourceGeneration struct {
+	generation string
+	identity   identity.Node
 }
 
 func NewIPv4PrefixProvider(log logr.Logger, apiWrapper api.Wrapper, workerPool worker.Worker,
@@ -85,6 +95,10 @@ func NewIPv4PrefixProvider(log logr.Logger, apiWrapper api.Wrapper, workerPool w
 }
 
 func (p *ipv4PrefixProvider) InitResource(instance ec2.EC2Instance) error {
+	return p.InitResourceForNode(instance, identity.Node{})
+}
+
+func (p *ipv4PrefixProvider) InitResourceForNode(instance ec2.EC2Instance, nodeIdentity identity.Node) error {
 	nodeName := instance.Name()
 
 	eniManager := eni.NewENIManager(instance)
@@ -172,11 +186,13 @@ func (p *ipv4PrefixProvider) InitResource(instance ec2.EC2Instance) error {
 		}
 	}
 
+	generation := uuid.NewString()
 	resourcePool := pool.NewResourcePool(p.log.WithName("prefix ipv4 address resource pool").
 		WithValues("node name", instance.Name()), prefixIPWPConfig, podToResourceMap,
-		warmResources, instance.Name(), nodeCapacity, true)
+		warmResources, instance.Name(), nodeCapacity, true, generation)
 
-	p.putInstanceProviderAndPool(nodeName, resourcePool, eniManager, nodeCapacity, isPDEnabled)
+	p.putInstanceProviderAndPoolForGeneration(nodeName, resourcePool, eniManager, nodeCapacity, isPDEnabled,
+		resourceGeneration{generation: generation, identity: nodeIdentity})
 
 	p.log.Info("initialized the resource provider for ipv4 prefix",
 		"capacity", nodeCapacity, "node name", nodeName, "instance type",
@@ -188,7 +204,7 @@ func (p *ipv4PrefixProvider) InitResource(instance ec2.EC2Instance) error {
 	}
 
 	// Submit the async job to periodically process the delete queue
-	p.SubmitAsyncJob(worker.NewWarmProcessDeleteQueueJob(nodeName))
+	p.SubmitAsyncJob(worker.NewWarmProcessDeleteQueueJob(nodeName, generation))
 	return nil
 }
 
@@ -286,11 +302,12 @@ func (p *ipv4PrefixProvider) ProcessAsyncJob(job interface{}) (ctrl.Result, erro
 // CreateIPv4PrefixAndUpdatePool executes the Create IPv4 Prefix workflow by assigning enough prefixes to satisfy
 // the desired number of prefixes required by the warm pool job
 func (p *ipv4PrefixProvider) CreateIPv4PrefixAndUpdatePool(job *worker.WarmPoolJob) {
-	instanceResource, found := p.getInstanceProviderAndPool(job.NodeName)
+	instanceResource, release, found := p.lockResourceForJob(job)
 	if !found {
 		p.log.Error(utils.ErrNotFound, utils.ErrMsgProviderAndPoolNotFound, "node name", job.NodeName)
 		return
 	}
+	defer release()
 
 	// For successful jobs or non-retryable errors, do not re-sync or reconcile the pool.
 	notRetry := true
@@ -323,11 +340,12 @@ func (p *ipv4PrefixProvider) CreateIPv4PrefixAndUpdatePool(job *worker.WarmPoolJ
 
 // DeleteIPv4PrefixAndUpdatePool executes the Delete IPv4 Prefix workflow for the list of prefixes provided in the warm pool job
 func (p *ipv4PrefixProvider) DeleteIPv4PrefixAndUpdatePool(job *worker.WarmPoolJob) {
-	instanceResource, found := p.getInstanceProviderAndPool(job.NodeName)
+	instanceResource, release, found := p.lockResourceForJob(job)
 	if !found {
 		p.log.Error(utils.ErrNotFound, utils.ErrMsgProviderAndPoolNotFound, "node name", job.NodeName)
 		return
 	}
+	defer release()
 
 	didSucceed := true
 	failedResources, err := instanceResource.eniManager.DeleteIPV4Resource(job.Resources, config.ResourceTypeIPv4Prefix,
@@ -342,11 +360,12 @@ func (p *ipv4PrefixProvider) DeleteIPv4PrefixAndUpdatePool(job *worker.WarmPoolJ
 }
 
 func (p *ipv4PrefixProvider) ReSyncPool(job *worker.WarmPoolJob) {
-	providerAndPool, found := p.instanceProviderAndPool[job.NodeName]
+	providerAndPool, release, found := p.lockResourceForJob(job)
 	if !found {
 		p.log.Error(utils.ErrNotFound, "node is not initialized", "node name", job.NodeName)
 		return
 	}
+	defer release()
 
 	ipV4Resources, err := providerAndPool.eniManager.InitResources(p.apiWrapper.EC2API)
 	if err != nil || ipV4Resources == nil {
@@ -358,11 +377,12 @@ func (p *ipv4PrefixProvider) ReSyncPool(job *worker.WarmPoolJob) {
 }
 
 func (p *ipv4PrefixProvider) ProcessDeleteQueue(job *worker.WarmPoolJob) (ctrl.Result, error) {
-	resourceProviderAndPool, isPresent := p.getInstanceProviderAndPool(job.NodeName)
+	resourceProviderAndPool, release, isPresent := p.lockResourceForJob(job)
 	if !isPresent {
 		p.log.Info("forgetting the delete queue processing job", "node name", job.NodeName)
 		return ctrl.Result{}, nil
 	}
+	defer release()
 	// TODO: For efficiency run only when required in next release
 	resourceProviderAndPool.resourcePool.ProcessCoolDownQueue()
 
@@ -396,6 +416,22 @@ func (p *ipv4PrefixProvider) GetPool(nodeName string) (pool.Pool, bool) {
 		return nil, false
 	}
 	return providerAndPool.resourcePool, true
+}
+
+// AcquirePool holds the current provider generation stable while a synchronous
+// Pod operation mutates the pool and commits its annotation.
+func (p *ipv4PrefixProvider) AcquirePool(nodeName string, expected identity.Node) (pool.Pool, func(), bool) {
+	resource, found := p.getInstanceProviderAndPool(nodeName)
+	if !found {
+		return nil, nil, false
+	}
+	resource.lock.RLock()
+	current, stillCurrent := p.getInstanceProviderAndPool(nodeName)
+	if !stillCurrent || current != resource || !identity.Matches(expected, resource.identity) {
+		resource.lock.RUnlock()
+		return nil, nil, false
+	}
+	return resource.resourcePool, resource.lock.RUnlock, true
 }
 
 func (p *ipv4PrefixProvider) IsInstanceSupported(instance ec2.EC2Instance) bool {
@@ -460,18 +496,50 @@ func (p *ipv4PrefixProvider) IntrospectNode(node string) interface{} {
 
 // putInstanceProviderAndPool stores the node's instance provider and pool to the cache
 func (p *ipv4PrefixProvider) putInstanceProviderAndPool(nodeName string, resourcePool pool.Pool, manager eni.ENIManager, capacity int,
-	isPrevPDEnabled bool) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
+	isPrevPDEnabled bool, generations ...string) {
+	generation := ""
+	if len(generations) > 0 {
+		generation = generations[0]
+	}
+	p.putInstanceProviderAndPoolForGeneration(nodeName, resourcePool, manager, capacity, isPrevPDEnabled,
+		resourceGeneration{generation: generation})
+}
 
+func (p *ipv4PrefixProvider) putInstanceProviderAndPoolForGeneration(nodeName string, resourcePool pool.Pool,
+	manager eni.ENIManager, capacity int, isPrevPDEnabled bool, generations ...resourceGeneration,
+) {
+	var resourceIdentity resourceGeneration
+	if len(generations) > 0 {
+		resourceIdentity = generations[0]
+	}
 	resource := &ResourceProviderAndPool{
 		eniManager:      manager,
 		resourcePool:    resourcePool,
+		generation:      resourceIdentity.generation,
+		identity:        resourceIdentity.identity,
 		capacity:        capacity,
 		isPrevPDEnabled: isPrevPDEnabled,
 	}
-
-	p.instanceProviderAndPool[nodeName] = resource
+	for {
+		previous, found := p.getInstanceProviderAndPool(nodeName)
+		if found {
+			previous.lock.Lock()
+		}
+		p.lock.Lock()
+		current, stillPresent := p.instanceProviderAndPool[nodeName]
+		if (found && current == previous) || (!found && !stillPresent) {
+			p.instanceProviderAndPool[nodeName] = resource
+			p.lock.Unlock()
+			if found {
+				previous.lock.Unlock()
+			}
+			return
+		}
+		p.lock.Unlock()
+		if found {
+			previous.lock.Unlock()
+		}
+	}
 }
 
 // getInstanceProviderAndPool returns the node's instance provider and pool from the cache
@@ -483,12 +551,42 @@ func (p *ipv4PrefixProvider) getInstanceProviderAndPool(nodeName string) (*Resou
 	return resource, found
 }
 
+func (p *ipv4PrefixProvider) lockResourceForJob(job *worker.WarmPoolJob) (*ResourceProviderAndPool, func(), bool) {
+	resource, found := p.getInstanceProviderAndPool(job.NodeName)
+	if !found {
+		return nil, nil, false
+	}
+	resource.lock.RLock()
+	current, stillCurrent := p.getInstanceProviderAndPool(job.NodeName)
+	if !stillCurrent || current != resource || resource.generation != job.Generation {
+		resource.lock.RUnlock()
+		currentGeneration := ""
+		if stillCurrent {
+			currentGeneration = current.generation
+		}
+		p.log.Info("ignoring warm pool job from a previous node generation",
+			"node", job.NodeName, "jobGeneration", job.Generation,
+			"currentGeneration", currentGeneration)
+		return nil, nil, false
+	}
+	return resource, resource.lock.RUnlock, true
+}
+
 // deleteInstanceProviderAndPool deletes the node's instance provider and pool from the cache
 func (p *ipv4PrefixProvider) deleteInstanceProviderAndPool(nodeName string) {
+	resource, found := p.getInstanceProviderAndPool(nodeName)
+	if !found {
+		return
+	}
+	resource.lock.Lock()
+	defer resource.lock.Unlock()
+
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
-	delete(p.instanceProviderAndPool, nodeName)
+	if p.instanceProviderAndPool[nodeName] == resource {
+		delete(p.instanceProviderAndPool, nodeName)
+	}
 }
 
 // getCapacity returns the capacity for IPv4 addresses deconstructed from IPv4 prefixes based on the instance type and the instance os;

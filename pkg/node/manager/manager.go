@@ -27,16 +27,19 @@ import (
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/config"
 	rcHealthz "github.com/aws/amazon-vpc-resource-controller-k8s/pkg/healthz"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/node"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/provider"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/resource"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils"
 	asyncWorker "github.com/aws/amazon-vpc-resource-controller-k8s/pkg/worker"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/samber/lo"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/go-logr/logr"
 	v1 "k8s.io/api/core/v1"
@@ -49,6 +52,15 @@ type manager struct {
 	lock sync.RWMutex
 	// dataStore is the in memory data store of all the managed/un-managed nodes in the cluster
 	dataStore map[string]node.Node
+	// nodeGenerations fences asynchronous jobs belonging to an older lifecycle
+	// of a same-name Kubernetes Node.
+	nodeGenerations map[string]string
+	// activeNodeInits keeps a previous generation's cleanup barrier in place
+	// until every Init that was already running has finished and cleaned up.
+	activeNodeInits map[nodeGeneration]int
+	// deletingNodes contains the instance generation whose asynchronous
+	// provider cleanup must finish before a same-name Node can be added.
+	deletingNodes map[string]nodeDeletion
 	// resourceManager provides the resource provider for all supported resources
 	resourceManager resource.ResourceManager
 	// wrapper around the clients for all APIs used by controller
@@ -70,6 +82,8 @@ type Manager interface {
 	CheckNodeForLeakedENIs(nodeName string)
 	SkipHealthCheck() bool
 }
+
+var ErrNodeCleanupInProgress = errors.New("cleanup for the previous node generation is still in progress")
 
 // AsyncOperation is operation on a node after the lock has been released.
 // All AsyncOperation are done without lock as it involves API calls that
@@ -94,12 +108,45 @@ const (
 )
 
 type AsyncOperationJob struct {
-	op       AsyncOperation
-	node     node.Node
-	nodeName string
+	op         AsyncOperation
+	node       node.Node
+	nodeName   string
+	generation string
 }
 
 const pausingHealthCheckDuration = 10 * time.Minute
+
+const nodeDeleteRetryDelay = 30 * time.Second
+
+const nodeInitRetryDelay = time.Second
+
+type nodeDeletion struct {
+	instanceID       string
+	generation       string
+	activeCleanups   int
+	cleanupSucceeded bool
+}
+
+type nodeGeneration struct {
+	nodeName   string
+	generation string
+}
+
+var (
+	nodeGenerationCleanupRetryCount = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "node_generation_cleanup_retry_total",
+			Help: "The number of failed node-generation cleanup attempts that were requeued",
+		},
+	)
+	nodeGenerationCleanupPending = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "node_generation_cleanup_pending",
+			Help: "The number of node generations waiting for provider cleanup",
+		},
+	)
+	nodeGenerationMetricsOnce sync.Once
+)
 
 // NewNodeManager returns a new node manager
 func NewNodeManager(logger logr.Logger, resourceManager resource.ResourceManager,
@@ -109,12 +156,18 @@ func NewNodeManager(logger logr.Logger, resourceManager resource.ResourceManager
 		resourceManager:   resourceManager,
 		Log:               logger,
 		dataStore:         make(map[string]node.Node),
+		nodeGenerations:   make(map[string]string),
+		activeNodeInits:   make(map[nodeGeneration]int),
+		deletingNodes:     make(map[string]nodeDeletion),
 		wrapper:           wrapper,
 		worker:            worker,
 		conditions:        conditions,
 		controllerVersion: controllerVersion,
 		clusterName:       clusterName,
 	}
+	nodeGenerationMetricsOnce.Do(func() {
+		metrics.Registry.MustRegister(nodeGenerationCleanupRetryCount, nodeGenerationCleanupPending)
+	})
 
 	// add health check on subpath for node manager
 	healthzHandler.AddControllersHealthCheckers(
@@ -170,6 +223,12 @@ func (m *manager) AddNode(nodeName string) error {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
+	if previous, pending := m.deletingNodes[nodeName]; pending {
+		m.Log.Info("waiting for previous node generation cleanup before adding node",
+			"nodeName", nodeName, "previousInstanceID", previous.instanceID)
+		return fmt.Errorf("%w: node %s instance %s", ErrNodeCleanupInProgress, nodeName, previous.instanceID)
+	}
+
 	k8sNode, err := m.wrapper.K8sAPI.GetNode(nodeName)
 	if err != nil {
 		return fmt.Errorf("failed to add node %s, doesn't exist in cache anymore", nodeName)
@@ -197,29 +256,33 @@ func (m *manager) AddNode(nodeName string) error {
 	}
 
 	var op AsyncOperation
+	generation := uuid.NewString()
 
 	if shouldManage {
 		newNode = node.NewManagedNode(m.Log, k8sNode.Name, GetNodeInstanceID(k8sNode),
-			GetNodeOS(k8sNode), m.wrapper.K8sAPI, m.wrapper.EC2API)
+			GetNodeOS(k8sNode), m.wrapper.K8sAPI, m.wrapper.EC2API, k8sNode.UID)
 		err := m.updateSubnetIfUsingENIConfig(newNode, k8sNode)
 		if err != nil {
 			return err
 		}
 		m.dataStore[k8sNode.Name] = newNode
+		m.setNodeGenerationLocked(k8sNode.Name, generation)
 		log.Info("node added as a managed node")
 		op = Init
 	} else {
 		newNode = node.NewUnManagedNode(m.Log, k8sNode.Name, GetNodeInstanceID(k8sNode),
-			GetNodeOS(k8sNode))
+			GetNodeOS(k8sNode), k8sNode.UID)
 		m.dataStore[k8sNode.Name] = newNode
+		m.setNodeGenerationLocked(k8sNode.Name, generation)
 		log.V(1).Info("node added as an un-managed node")
 		return nil
 	}
 
 	m.worker.SubmitJob(AsyncOperationJob{
-		op:       op,
-		node:     newNode,
-		nodeName: nodeName,
+		op:         op,
+		node:       newNode,
+		nodeName:   nodeName,
+		generation: generation,
 	})
 	return nil
 }
@@ -267,26 +330,38 @@ func (m *manager) UpdateNode(nodeName string) error {
 		return err
 	}
 
+	generation := m.nodeGenerationLocked(nodeName)
 	switch status {
 	case UnManagedToManaged:
+		if previous, pending := m.deletingNodes[nodeName]; pending {
+			return fmt.Errorf("%w: node %s instance %s", ErrNodeCleanupInProgress,
+				nodeName, previous.instanceID)
+		}
 		log.Info("node was previously un-managed, will be added as managed node now")
 		cachedNode = node.NewManagedNode(m.Log, k8sNode.Name,
 			GetNodeInstanceID(k8sNode), GetNodeOS(k8sNode),
-			m.wrapper.K8sAPI, m.wrapper.EC2API)
+			m.wrapper.K8sAPI, m.wrapper.EC2API, k8sNode.UID)
 		// Update the Subnet if the node has custom networking configured
 		err = m.updateSubnetIfUsingENIConfig(cachedNode, k8sNode)
 		if err != nil {
 			return err
 		}
 		m.dataStore[nodeName] = cachedNode
+		generation = uuid.NewString()
+		m.setNodeGenerationLocked(nodeName, generation)
 		op = Init
 	case ManagedToUnManaged:
 		log.Info("node was being managed earlier, will be added as un-managed node now")
 		// Change the node in cache, but for de initializing all resource providers
 		// pass the async job the older cached value instead
+		previousGeneration := generation
 		m.dataStore[nodeName] = node.NewUnManagedNode(m.Log, k8sNode.Name,
-			GetNodeInstanceID(k8sNode), GetNodeOS(k8sNode))
+			GetNodeInstanceID(k8sNode), GetNodeOS(k8sNode), k8sNode.UID)
+		generation = uuid.NewString()
+		m.setNodeGenerationLocked(nodeName, generation)
+		m.startNodeDeletionLocked(nodeName, cachedNode.GetNodeInstanceID(), previousGeneration)
 		op = Delete
+		generation = previousGeneration
 	case StillManaged:
 		// We only need to update the Subnet for Managed Node. This subnet is required for creating
 		// Branch ENIs when user is using Custom Networking. In future, we should move this to
@@ -303,9 +378,10 @@ func (m *manager) UpdateNode(nodeName string) error {
 	}
 
 	m.worker.SubmitJob(AsyncOperationJob{
-		op:       op,
-		node:     cachedNode,
-		nodeName: nodeName,
+		op:         op,
+		node:       cachedNode,
+		nodeName:   nodeName,
+		generation: generation,
 	})
 	return nil
 }
@@ -342,16 +418,20 @@ func (m *manager) DeleteNode(nodeName string) error {
 	}
 
 	delete(m.dataStore, nodeName)
+	generation := m.nodeGenerationLocked(nodeName)
+	delete(m.nodeGenerations, nodeName)
 
 	if !cachedNode.IsManaged() {
 		log.V(1).Info("un managed node removed from data store")
 		return nil
 	}
 
+	m.startNodeDeletionLocked(nodeName, cachedNode.GetNodeInstanceID(), generation)
 	m.worker.SubmitJob(AsyncOperationJob{
-		op:       Delete,
-		node:     cachedNode,
-		nodeName: nodeName,
+		op:         Delete,
+		node:       cachedNode,
+		nodeName:   nodeName,
+		generation: generation,
 	})
 
 	log.Info("node removed from data store")
@@ -426,38 +506,109 @@ func (m *manager) performAsyncOperation(job interface{}) (ctrl.Result, error) {
 
 	log := m.Log.WithValues("node", asyncJob.nodeName, "operation", asyncJob.op)
 
-	var err error
 	switch asyncJob.op {
 	case Init:
-		utils.SendNodeEventWithNodeName(m.wrapper.K8sAPI, asyncJob.nodeName, utils.VersionNotice, fmt.Sprintf("The node is managed by VPC resource controller version %s", m.controllerVersion), v1.EventTypeNormal, m.Log)
-		err = asyncJob.node.InitResources(m.resourceManager)
-		if err != nil {
-			if pauseHealthCheckOnError(err) && !m.SkipHealthCheck() {
-				m.setStopHealthCheck()
-				log.Info("node manager sets a pause on health check due to observing a EC2 error", "error", err.Error())
-			}
-			log.Error(err, "removing the node from cache as it failed to initialize")
-			m.removeNodeSafe(asyncJob.nodeName)
-			// if initializing node failed, we want to make this visible although the manager will retry
-			// the trunk label will stay as false until retry succeed
-
-			// Node will be retried for init on next event
+		if !m.beginNodeInit(asyncJob.nodeName, asyncJob.generation) {
+			log.Info("skipping stale node operation", "generation", asyncJob.generation)
 			return ctrl.Result{}, nil
 		}
-
-		// If there's no error, we need to update the node so the capacity is advertised
-		asyncJob.op = Update
-		return m.performAsyncOperation(asyncJob)
+		defer m.endNodeInit(asyncJob.nodeName, asyncJob.generation)
+		return m.performNodeInit(asyncJob, log)
 	case Update:
-		err = asyncJob.node.UpdateResources(m.resourceManager)
+		if !m.isCurrentNodeGeneration(asyncJob.nodeName, asyncJob.generation) {
+			log.Info("skipping stale node operation", "generation", asyncJob.generation)
+			return ctrl.Result{}, nil
+		}
+		return m.finishNodeOperation(asyncJob,
+			asyncJob.node.UpdateResources(m.resourceManager), log)
 	case Delete:
-		err = asyncJob.node.DeleteResources(m.resourceManager)
+		return m.performNodeDelete(asyncJob, log)
 	default:
 		m.Log.V(1).Info("no operation operation requested",
 			"node", asyncJob.nodeName)
 		return ctrl.Result{}, nil
 	}
+}
 
+func (m *manager) performNodeInit(asyncJob AsyncOperationJob,
+	log logr.Logger,
+) (ctrl.Result, error) {
+	utils.SendNodeEventWithNodeName(m.wrapper.K8sAPI, asyncJob.nodeName, utils.VersionNotice,
+		fmt.Sprintf("The node is managed by VPC resource controller version %s", m.controllerVersion),
+		v1.EventTypeNormal, m.Log)
+	if err := asyncJob.node.InitResources(m.resourceManager); err != nil {
+		return m.handleNodeInitError(asyncJob, err, log)
+	}
+	if !m.isCurrentNodeGeneration(asyncJob.nodeName, asyncJob.generation) {
+		return m.cleanupStaleNodeGeneration(asyncJob, log)
+	}
+	asyncJob.op = Update
+	return m.performAsyncOperation(asyncJob)
+}
+
+func (m *manager) handleNodeInitError(asyncJob AsyncOperationJob, err error,
+	log logr.Logger,
+) (ctrl.Result, error) {
+	if !m.isCurrentNodeGeneration(asyncJob.nodeName, asyncJob.generation) {
+		return m.cleanupStaleNodeGeneration(asyncJob, log)
+	}
+	if errors.Is(err, provider.ErrNodeGenerationCleanupInProgress) {
+		nodeGenerationCleanupRetryCount.Inc()
+		log.Info("waiting for previous provider generation cleanup")
+		return ctrl.Result{Requeue: true, RequeueAfter: nodeInitRetryDelay}, nil
+	}
+	if pauseHealthCheckOnError(err) && !m.SkipHealthCheck() {
+		m.setStopHealthCheck()
+		log.Info("node manager sets a pause on health check due to observing a EC2 error",
+			"error", err.Error())
+	}
+	log.Error(err, "removing the node from cache as it failed to initialize")
+	m.removeNodeSafe(asyncJob.nodeName, asyncJob.generation)
+	// Node will be retried for init on the next event.
+	return ctrl.Result{}, nil
+}
+
+func (m *manager) cleanupStaleNodeGeneration(asyncJob AsyncOperationJob,
+	log logr.Logger,
+) (ctrl.Result, error) {
+	log.Info("node generation changed while resources were initializing; cleaning up stale resources",
+		"generation", asyncJob.generation)
+	asyncJob.op = Delete
+	m.requireNodeCleanup(asyncJob.nodeName, asyncJob.node.GetNodeInstanceID(),
+		asyncJob.generation)
+	result, err := m.performNodeDelete(asyncJob, log)
+	if err == nil && result.Requeue {
+		// The worker is currently processing the original Init value. Submit the
+		// converted Delete explicitly so the timed retry cannot be requeued as a
+		// stale Init and silently abandon cleanup.
+		m.worker.SubmitJobAfter(asyncJob, result.RequeueAfter)
+		return ctrl.Result{}, nil
+	}
+	return result, err
+}
+
+func (m *manager) performNodeDelete(asyncJob AsyncOperationJob,
+	log logr.Logger,
+) (ctrl.Result, error) {
+	if !m.beginNodeCleanup(asyncJob.nodeName, asyncJob.generation) {
+		log.Info("skipping cleanup for a completed node generation",
+			"generation", asyncJob.generation)
+		return ctrl.Result{}, nil
+	}
+	err := asyncJob.node.DeleteResources(m.resourceManager)
+	m.finishNodeCleanup(asyncJob.nodeName, asyncJob.generation, err)
+	if err == nil {
+		log.V(1).Info("successfully performed node operation")
+		return ctrl.Result{}, nil
+	}
+	log.Error(err, "failed to perform node operation")
+	nodeGenerationCleanupRetryCount.Inc()
+	return ctrl.Result{Requeue: true, RequeueAfter: nodeDeleteRetryDelay}, nil
+}
+
+func (m *manager) finishNodeOperation(asyncJob AsyncOperationJob, err error,
+	log logr.Logger,
+) (ctrl.Result, error) {
 	if err == nil {
 		log.V(1).Info("successfully performed node operation")
 		return ctrl.Result{}, nil
@@ -465,6 +616,33 @@ func (m *manager) performAsyncOperation(job interface{}) (ctrl.Result, error) {
 	log.Error(err, "failed to perform node operation")
 
 	return ctrl.Result{}, nil
+}
+
+func (m *manager) beginNodeInit(nodeName, generation string) bool {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	if generation == "" || m.nodeGenerations[nodeName] != generation {
+		return false
+	}
+	if m.activeNodeInits == nil {
+		m.activeNodeInits = make(map[nodeGeneration]int)
+	}
+	m.activeNodeInits[nodeGeneration{nodeName: nodeName, generation: generation}]++
+	return true
+}
+
+func (m *manager) endNodeInit(nodeName, generation string) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	key := nodeGeneration{nodeName: nodeName, generation: generation}
+	if m.activeNodeInits[key] <= 1 {
+		delete(m.activeNodeInits, key)
+	} else {
+		m.activeNodeInits[key]--
+	}
+	m.completeNodeDeletionLocked(nodeName, generation)
 }
 
 // isSelectedForManagement returns true if the node should be managed by the controller
@@ -562,11 +740,109 @@ func (m *manager) customNetworkEnabledInCNINode(node *v1.Node) (bool, error) {
 	return false, err
 }
 
-func (m *manager) removeNodeSafe(nodeName string) {
+func (m *manager) removeNodeSafe(nodeName, generation string) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
+	if m.nodeGenerations[nodeName] != generation {
+		return
+	}
 	delete(m.dataStore, nodeName)
+	delete(m.nodeGenerations, nodeName)
+}
+
+func (m *manager) setNodeGenerationLocked(nodeName, generation string) {
+	if m.nodeGenerations == nil {
+		m.nodeGenerations = make(map[string]string)
+	}
+	m.nodeGenerations[nodeName] = generation
+}
+
+func (m *manager) nodeGenerationLocked(nodeName string) string {
+	if generation := m.nodeGenerations[nodeName]; generation != "" {
+		return generation
+	}
+	generation := uuid.NewString()
+	m.setNodeGenerationLocked(nodeName, generation)
+	return generation
+}
+
+func (m *manager) isCurrentNodeGeneration(nodeName, generation string) bool {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	return generation != "" && m.nodeGenerations[nodeName] == generation
+}
+
+func (m *manager) startNodeDeletionLocked(nodeName, instanceID, generation string) {
+	if m.deletingNodes == nil {
+		m.deletingNodes = make(map[string]nodeDeletion)
+	}
+	if deleting, pending := m.deletingNodes[nodeName]; pending &&
+		deleting.generation == generation {
+		deleting.cleanupSucceeded = false
+		m.deletingNodes[nodeName] = deleting
+		return
+	}
+	if _, pending := m.deletingNodes[nodeName]; !pending {
+		nodeGenerationCleanupPending.Inc()
+	}
+	m.deletingNodes[nodeName] = nodeDeletion{
+		instanceID:       instanceID,
+		generation:       generation,
+		cleanupSucceeded: false,
+	}
+}
+
+func (m *manager) requireNodeCleanup(nodeName, instanceID, generation string) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	m.startNodeDeletionLocked(nodeName, instanceID, generation)
+}
+
+func (m *manager) beginNodeCleanup(nodeName, generation string) bool {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	deleting, pending := m.deletingNodes[nodeName]
+	if !pending || deleting.generation != generation {
+		return false
+	}
+	deleting.activeCleanups++
+	m.deletingNodes[nodeName] = deleting
+	return true
+}
+
+func (m *manager) finishNodeCleanup(nodeName, generation string, cleanupErr error) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	deleting, pending := m.deletingNodes[nodeName]
+	if !pending || deleting.generation != generation {
+		return
+	}
+	if deleting.activeCleanups > 0 {
+		deleting.activeCleanups--
+	}
+	// When cleanup attempts overlap, the result of the last attempt to finish
+	// controls the barrier. A success must not remain sticky across a later
+	// failure.
+	deleting.cleanupSucceeded = cleanupErr == nil
+	m.deletingNodes[nodeName] = deleting
+	m.completeNodeDeletionLocked(nodeName, generation)
+}
+
+func (m *manager) completeNodeDeletionLocked(nodeName, generation string) {
+	deleting, pending := m.deletingNodes[nodeName]
+	if !pending || deleting.generation != generation ||
+		deleting.activeCleanups != 0 || !deleting.cleanupSucceeded {
+		return
+	}
+	key := nodeGeneration{nodeName: nodeName, generation: generation}
+	if m.activeNodeInits[key] != 0 {
+		return
+	}
+	delete(m.deletingNodes, nodeName)
+	nodeGenerationCleanupPending.Dec()
 }
 
 func (m *manager) check() healthz.Checker {

@@ -14,12 +14,23 @@
 package provider
 
 import (
+	"errors"
+
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/aws/ec2"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/identity"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/pool"
 )
+
+// ErrNodeGenerationCleanupInProgress indicates that initialization must wait
+// for provider state owned by a previous same-name Node generation.
+var ErrNodeGenerationCleanupInProgress = errors.New("previous node generation cleanup is still in progress")
+
+// ErrNodeIdentityMismatch indicates that an allocation reached provider state
+// owned by a different Kubernetes Node generation.
+var ErrNodeIdentityMismatch = errors.New("provider state belongs to a different node generation")
 
 // ResourceProvider is the provider interface that each resource managed by the controller has to implement
 type ResourceProvider interface {
@@ -46,4 +57,16 @@ type ResourceProvider interface {
 	// IntrospectSummary allows introspection of resources summary per node
 	IntrospectSummary() interface{}
 	ReconcileNode(nodeName string) bool
+}
+
+// NodeGenerationProvider receives the Kubernetes Node generation that owns
+// provider state initialized from an EC2 instance.
+type NodeGenerationProvider interface {
+	InitResourceForNode(instance ec2.EC2Instance, nodeIdentity identity.Node) error
+}
+
+// PoolLeaseProvider lets synchronous Pod operations hold a provider generation
+// stable until their pool mutation and Pod annotation are complete.
+type PoolLeaseProvider interface {
+	AcquirePool(nodeName string, expected identity.Node) (pool.Pool, func(), bool)
 }

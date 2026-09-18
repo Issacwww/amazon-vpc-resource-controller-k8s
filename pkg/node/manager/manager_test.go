@@ -31,6 +31,8 @@ import (
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/config"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/healthz"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/node"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/provider"
+	rcresource "github.com/aws/amazon-vpc-resource-controller-k8s/pkg/resource"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/utils"
 
 	"github.com/golang/mock/gomock"
@@ -52,6 +54,7 @@ var (
 	nodeName        = "ip-192-168-55-73.us-west-2.compute.internal"
 	securityGroupId = "sg-1"
 	mockClusterName = "cluster-name"
+	testGeneration  = "test-generation"
 
 	eniConfig = &v1alpha1.ENIConfig{
 		ObjectMeta: metav1.ObjectMeta{
@@ -138,10 +141,16 @@ func NewMock(ctrl *gomock.Controller, existingDataStore map[string]node.Node) Mo
 	mockNode := mock_node.NewMockNode(ctrl)
 	mockConditions := mock_condition.NewMockConditions(ctrl)
 
+	nodeGenerations := make(map[string]string, len(existingDataStore))
+	for existingNodeName := range existingDataStore {
+		nodeGenerations[existingNodeName] = testGeneration
+	}
 	return Mock{
 		Manager: manager{
-			dataStore: existingDataStore,
-			Log:       zap.New(),
+			dataStore:       existingDataStore,
+			nodeGenerations: nodeGenerations,
+			deletingNodes:   make(map[string]nodeDeletion),
+			Log:             zap.New(),
 			wrapper: api.Wrapper{
 				K8sAPI: mockK8sWrapper,
 				EC2API: mockEC2APIHelper,
@@ -211,6 +220,22 @@ func Test_AddNode_CNINode_Existing(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Contains(t, mock.Manager.dataStore, nodeName)
 	assert.True(t, AreNodesEqual(mock.Manager.dataStore[nodeName], managedNode))
+}
+
+func Test_AddNode_WaitsForPreviousGenerationCleanup(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mock := NewMock(ctrl, map[string]node.Node{})
+	mock.Manager.deletingNodes[nodeName] = nodeDeletion{
+		instanceID: "i-old",
+		generation: "old-generation",
+	}
+
+	err := mock.Manager.AddNode(nodeName)
+
+	assert.ErrorIs(t, err, ErrNodeCleanupInProgress)
+	assert.NotContains(t, mock.Manager.dataStore, nodeName)
 }
 
 func Test_AddNode_CNINode_Not_Existing(t *testing.T) {
@@ -527,6 +552,23 @@ func Test_UpdateNode_UnManagedToManaged(t *testing.T) {
 	assert.True(t, AreNodesEqual(mock.Manager.dataStore[nodeName], managedNode))
 }
 
+func Test_UpdateNode_UnManagedToManagedWaitsForCleanup(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mock := NewMock(ctrl, map[string]node.Node{v1Node.Name: unManagedNode})
+	mock.Manager.deletingNodes[nodeName] = nodeDeletion{
+		instanceID: instanceID,
+		generation: "previous-generation",
+	}
+	mock.MockK8sAPI.EXPECT().GetNode(v1Node.Name).Return(v1Node, nil)
+
+	err := mock.Manager.UpdateNode(v1Node.Name)
+
+	assert.ErrorIs(t, err, ErrNodeCleanupInProgress)
+	assert.Equal(t, unManagedNode, mock.Manager.dataStore[nodeName])
+}
+
 func Test_UpdateNode_UnManagedToManaged_WithENIConfig_NodeLabel(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -604,6 +646,10 @@ func Test_DeleteNode_Managed(t *testing.T) {
 	err := mock.Manager.DeleteNode(v1Node.Name)
 	assert.NoError(t, err)
 	assert.NotContains(t, mock.Manager.dataStore, nodeName)
+	assert.Equal(t, nodeDeletion{
+		instanceID: instanceID,
+		generation: testGeneration,
+	}, mock.Manager.deletingNodes[nodeName])
 }
 
 func Test_DeleteNode_UnManaged(t *testing.T) {
@@ -636,8 +682,9 @@ func Test_performAsyncOperation(t *testing.T) {
 	mock := NewMock(ctrl, map[string]node.Node{nodeName: managedNode})
 
 	job := AsyncOperationJob{
-		node:     mock.MockNode,
-		nodeName: nodeName,
+		node:       mock.MockNode,
+		nodeName:   nodeName,
+		generation: testGeneration,
 	}
 
 	job.op = Init
@@ -658,8 +705,13 @@ func Test_performAsyncOperation(t *testing.T) {
 
 	job.op = Delete
 	mock.MockNode.EXPECT().DeleteResources(mock.MockResourceManager).Return(nil)
+	mock.Manager.deletingNodes[nodeName] = nodeDeletion{
+		instanceID: instanceID,
+		generation: testGeneration,
+	}
 	_, err = mock.Manager.performAsyncOperation(job)
 	assert.NoError(t, err)
+	assert.NotContains(t, mock.Manager.deletingNodes, nodeName)
 
 	job.op = ""
 	_, err = mock.Manager.performAsyncOperation(job)
@@ -673,9 +725,10 @@ func Test_performAsyncOperation_fail(t *testing.T) {
 	mock := NewMock(ctrl, map[string]node.Node{nodeName: managedNode})
 
 	job := AsyncOperationJob{
-		node:     mock.MockNode,
-		nodeName: nodeName,
-		op:       Init,
+		node:       mock.MockNode,
+		nodeName:   nodeName,
+		op:         Init,
+		generation: testGeneration,
 	}
 
 	mock.MockNode.EXPECT().InitResources(mock.MockResourceManager).Return(&node.ErrInitResources{})
@@ -687,6 +740,36 @@ func Test_performAsyncOperation_fail(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func Test_performAsyncOperation_WaitsForPreviousProviderGeneration(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mock := NewMock(ctrl, map[string]node.Node{})
+	mock.Manager.dataStore[nodeName] = mock.MockNode
+	mock.Manager.nodeGenerations[nodeName] = testGeneration
+	job := AsyncOperationJob{
+		node:       mock.MockNode,
+		nodeName:   nodeName,
+		op:         Init,
+		generation: testGeneration,
+	}
+
+	mock.MockK8sAPI.EXPECT().GetNode(nodeName).Return(v1Node, nil)
+	mock.MockK8sAPI.EXPECT().BroadcastEvent(v1Node, utils.VersionNotice,
+		fmt.Sprintf("The node is managed by VPC resource controller version %s", mock.Manager.controllerVersion),
+		v1.EventTypeNormal)
+	mock.MockNode.EXPECT().InitResources(mock.MockResourceManager).Return(&node.ErrInitResources{
+		Err: provider.ErrNodeGenerationCleanupInProgress,
+	})
+
+	result, err := mock.Manager.performAsyncOperation(job)
+
+	assert.NoError(t, err)
+	assert.True(t, result.Requeue)
+	assert.Equal(t, nodeInitRetryDelay, result.RequeueAfter)
+	assert.Equal(t, mock.MockNode, mock.Manager.dataStore[nodeName])
+}
+
 func Test_performAsyncOperation_fail_pausingHealthCheck(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -694,16 +777,17 @@ func Test_performAsyncOperation_fail_pausingHealthCheck(t *testing.T) {
 	mock := NewMock(ctrl, map[string]node.Node{nodeName: managedNode})
 
 	job := AsyncOperationJob{
-		node:     mock.MockNode,
-		nodeName: nodeName,
-		op:       Init,
+		node:       mock.MockNode,
+		nodeName:   nodeName,
+		op:         Init,
+		generation: testGeneration,
 	}
 
 	mock.MockNode.EXPECT().InitResources(mock.MockResourceManager).Return(&node.ErrInitResources{
 		Err: errors.New("RequestLimitExceeded: Request limit exceeded.\n\tstatus code: 503, request id: 123-123-123-123-123"),
-	}).Times(2)
-	mock.MockK8sAPI.EXPECT().GetNode(nodeName).Return(v1Node, nil).Times(2)
-	mock.MockK8sAPI.EXPECT().BroadcastEvent(v1Node, utils.VersionNotice, fmt.Sprintf("The node is managed by VPC resource controller version %s", mock.Manager.controllerVersion), v1.EventTypeNormal).Times(2)
+	})
+	mock.MockK8sAPI.EXPECT().GetNode(nodeName).Return(v1Node, nil)
+	mock.MockK8sAPI.EXPECT().BroadcastEvent(v1Node, utils.VersionNotice, fmt.Sprintf("The node is managed by VPC resource controller version %s", mock.Manager.controllerVersion), v1.EventTypeNormal)
 
 	_, err := mock.Manager.performAsyncOperation(job)
 	time.Sleep(time.Millisecond * 100)
@@ -717,6 +801,176 @@ func Test_performAsyncOperation_fail_pausingHealthCheck(t *testing.T) {
 	time.Sleep(time.Millisecond * 100)
 	assert.True(t, mock.Manager.SkipHealthCheck())
 	assert.True(t, time.Since(mock.Manager.stopHealthCheckAt) > time.Second*2 && time.Since(mock.Manager.stopHealthCheckAt) < time.Second*3)
+}
+
+func Test_performAsyncOperation_DeleteFailureKeepsGenerationBarrier(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mock := NewMock(ctrl, map[string]node.Node{})
+	mock.Manager.deletingNodes[nodeName] = nodeDeletion{
+		instanceID: instanceID,
+		generation: testGeneration,
+	}
+	job := AsyncOperationJob{
+		node:       mock.MockNode,
+		nodeName:   nodeName,
+		op:         Delete,
+		generation: testGeneration,
+	}
+
+	mock.MockNode.EXPECT().DeleteResources(mock.MockResourceManager).Return(mockError)
+
+	result, err := mock.Manager.performAsyncOperation(job)
+
+	assert.NoError(t, err)
+	assert.True(t, result.Requeue)
+	assert.Equal(t, nodeDeleteRetryDelay, result.RequeueAfter)
+	assert.Equal(t, nodeDeletion{
+		instanceID: instanceID,
+		generation: testGeneration,
+	}, mock.Manager.deletingNodes[nodeName])
+}
+
+func Test_performAsyncOperation_CleansUpInitThatFinishesAfterGenerationChange(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mock := NewMock(ctrl, map[string]node.Node{nodeName: managedNode})
+	job := AsyncOperationJob{
+		node:       mock.MockNode,
+		nodeName:   nodeName,
+		op:         Init,
+		generation: testGeneration,
+	}
+	mock.MockK8sAPI.EXPECT().GetNode(nodeName).Return(v1Node, nil)
+	mock.MockK8sAPI.EXPECT().BroadcastEvent(v1Node, utils.VersionNotice,
+		fmt.Sprintf("The node is managed by VPC resource controller version %s", mock.Manager.controllerVersion),
+		v1.EventTypeNormal)
+	mock.MockNode.EXPECT().InitResources(mock.MockResourceManager).DoAndReturn(
+		func(rcresource.ResourceManager) error {
+			mock.Manager.nodeGenerations[nodeName] = "new-generation"
+			return nil
+		})
+	mock.MockNode.EXPECT().DeleteResources(mock.MockResourceManager).Return(nil)
+	mock.MockNode.EXPECT().GetNodeInstanceID().Return(instanceID)
+
+	result, err := mock.Manager.performAsyncOperation(job)
+
+	assert.NoError(t, err)
+	assert.False(t, result.Requeue)
+	assert.Zero(t, result.RequeueAfter)
+	assert.Equal(t, "new-generation", mock.Manager.nodeGenerations[nodeName])
+}
+
+func Test_performAsyncOperation_RequeuesFailedStaleInitAsDelete(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mock := NewMock(ctrl, map[string]node.Node{nodeName: managedNode})
+	job := AsyncOperationJob{
+		node:       mock.MockNode,
+		nodeName:   nodeName,
+		op:         Init,
+		generation: testGeneration,
+	}
+	mock.MockK8sAPI.EXPECT().GetNode(nodeName).Return(v1Node, nil)
+	mock.MockK8sAPI.EXPECT().BroadcastEvent(v1Node, utils.VersionNotice,
+		fmt.Sprintf("The node is managed by VPC resource controller version %s", mock.Manager.controllerVersion),
+		v1.EventTypeNormal)
+	mock.MockNode.EXPECT().InitResources(mock.MockResourceManager).DoAndReturn(
+		func(rcresource.ResourceManager) error {
+			mock.Manager.nodeGenerations[nodeName] = "new-generation"
+			return nil
+		})
+	mock.MockNode.EXPECT().GetNodeInstanceID().Return(instanceID)
+	mock.MockNode.EXPECT().DeleteResources(mock.MockResourceManager).Return(mockError)
+	mock.MockWorker.EXPECT().SubmitJobAfter(gomock.Any(), nodeDeleteRetryDelay).Do(
+		func(submitted interface{}, _ time.Duration) {
+			deleteJob := submitted.(AsyncOperationJob)
+			assert.Equal(t, Delete, deleteJob.op)
+			assert.Equal(t, testGeneration, deleteJob.generation)
+			assert.Equal(t, nodeName, deleteJob.nodeName)
+		})
+
+	result, err := mock.Manager.performAsyncOperation(job)
+
+	assert.NoError(t, err)
+	assert.False(t, result.Requeue)
+	assert.Contains(t, mock.Manager.deletingNodes, nodeName)
+}
+
+func Test_performAsyncOperation_SkipsQueuedStaleInit(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mock := NewMock(ctrl, map[string]node.Node{nodeName: managedNode})
+	job := AsyncOperationJob{
+		node:       mock.MockNode,
+		nodeName:   nodeName,
+		op:         Init,
+		generation: "old-generation",
+	}
+
+	result, err := mock.Manager.performAsyncOperation(job)
+
+	assert.NoError(t, err)
+	assert.False(t, result.Requeue)
+	assert.Zero(t, result.RequeueAfter)
+}
+
+func TestNodeCleanupBarrierWaitsForRunningInitAndFencesLateDelete(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mock := NewMock(ctrl, map[string]node.Node{nodeName: managedNode})
+	assert.True(t, mock.Manager.beginNodeInit(nodeName, testGeneration))
+	mock.Manager.startNodeDeletionLocked(nodeName, instanceID, testGeneration)
+	job := AsyncOperationJob{
+		node:       mock.MockNode,
+		nodeName:   nodeName,
+		op:         Delete,
+		generation: testGeneration,
+	}
+	mock.MockNode.EXPECT().DeleteResources(mock.MockResourceManager).Return(nil).Times(2)
+
+	result, err := mock.Manager.performAsyncOperation(job)
+	assert.NoError(t, err)
+	assert.False(t, result.Requeue)
+	assert.Contains(t, mock.Manager.deletingNodes, nodeName)
+
+	mock.Manager.requireNodeCleanup(nodeName, instanceID, testGeneration)
+	result, err = mock.Manager.performAsyncOperation(job)
+	assert.NoError(t, err)
+	assert.False(t, result.Requeue)
+	assert.Contains(t, mock.Manager.deletingNodes, nodeName)
+
+	mock.Manager.endNodeInit(nodeName, testGeneration)
+	assert.NotContains(t, mock.Manager.deletingNodes, nodeName)
+
+	result, err = mock.Manager.performAsyncOperation(job)
+	assert.NoError(t, err)
+	assert.False(t, result.Requeue)
+}
+
+func TestNodeCleanupBarrierUsesLastCompletedAttemptResult(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mock := NewMock(ctrl, map[string]node.Node{})
+	mock.Manager.startNodeDeletionLocked(nodeName, instanceID, testGeneration)
+	assert.True(t, mock.Manager.beginNodeCleanup(nodeName, testGeneration))
+	assert.True(t, mock.Manager.beginNodeCleanup(nodeName, testGeneration))
+
+	mock.Manager.finishNodeCleanup(nodeName, testGeneration, nil)
+	assert.Contains(t, mock.Manager.deletingNodes, nodeName)
+	mock.Manager.finishNodeCleanup(nodeName, testGeneration, mockError)
+	assert.Contains(t, mock.Manager.deletingNodes, nodeName)
+	assert.False(t, mock.Manager.deletingNodes[nodeName].cleanupSucceeded)
+
+	assert.True(t, mock.Manager.beginNodeCleanup(nodeName, testGeneration))
+	mock.Manager.finishNodeCleanup(nodeName, testGeneration, nil)
+	assert.NotContains(t, mock.Manager.deletingNodes, nodeName)
 }
 
 // Test_isPodENICapacitySet test if the pod-eni capacity then true is returned

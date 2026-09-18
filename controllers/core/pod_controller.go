@@ -22,6 +22,7 @@ import (
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/condition"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/config"
 	rcHealthz "github.com/aws/amazon-vpc-resource-controller-k8s/pkg/healthz"
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/identity"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/k8s"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/k8s/pod"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/node"
@@ -36,6 +37,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 )
 
@@ -50,6 +52,7 @@ type PodReconciler struct {
 	// Manager manages all the nodes on the cluster
 	NodeManager manager.Manager
 	K8sAPI      k8s.K8sWrapper
+	APIReader   client.Reader
 	// DataStore is the cache with memory optimized Pod Objects
 	DataStore cache.Indexer
 	Condition condition.Conditions
@@ -107,9 +110,19 @@ func (r *PodReconciler) Reconcile(request custom.Request) (ctrl.Result, error) {
 	node, foundInCache := r.NodeManager.GetNode(pod.Spec.NodeName)
 
 	nodeDeletedInCluster := false
-	if !isDeleteEvent && r.isNodeExistingInCluster(pod, logger) {
+	var currentNode *v1.Node
+	nodeExistsInCluster := false
+	if !isDeleteEvent {
+		currentNode, nodeExistsInCluster = r.getNodeInCluster(pod, logger)
+	}
+	if !isDeleteEvent && nodeExistsInCluster {
 		if !foundInCache {
 			logger.V(1).Info("pod's node is not yet initialized by the manager, will retry", "Requested", request.NamespacedName.String(), "Cached pod name", pod.ObjectMeta.Name, "Cached pod namespace", pod.ObjectMeta.Namespace)
+			return PodRequeueRequest, nil
+		} else if !cachedNodeMatchesKubernetesNode(node, currentNode) {
+			logger.Info("pod's cached node belongs to a previous instance generation; will retry",
+				"cachedInstanceID", node.GetNodeInstanceID(),
+				"currentInstanceID", manager.GetNodeInstanceID(currentNode))
 			return PodRequeueRequest, nil
 		} else if !node.IsManaged() {
 			if utils.PodHasENIRequest(pod) {
@@ -151,7 +164,14 @@ func (r *PodReconciler) Reconcile(request custom.Request) (ctrl.Result, error) {
 		if isDeleteEvent || hasPodCompleted || nodeDeletedInCluster {
 			result, err = resourceHandler.HandleDelete(pod)
 		} else {
-			result, err = resourceHandler.HandleCreate(int(totalCount), pod)
+			result, err = resourceHandler.HandleCreate(int(totalCount), pod, identity.Allocation{
+				Node: identity.Node{
+					Name:       currentNode.Name,
+					UID:        currentNode.UID,
+					InstanceID: manager.GetNodeInstanceID(currentNode),
+				},
+				PodUID: pod.UID,
+			})
 		}
 		if err != nil || result.Requeue {
 			return result, err
@@ -164,12 +184,33 @@ func (r *PodReconciler) Reconcile(request custom.Request) (ctrl.Result, error) {
 	return ctrl.Result{}, nil
 }
 
-func (r *PodReconciler) isNodeExistingInCluster(pod *v1.Pod, logger logr.Logger) bool {
-	if _, err := r.K8sAPI.GetNode(pod.Spec.NodeName); err != nil {
-		logger.V(1).Info("The requested pod's node has been deleted from the cluster", "PodName", pod.ObjectMeta.Name, "PodNamespace", pod.ObjectMeta.Namespace, "NodeName", pod.Spec.NodeName)
-		return false
+func (r *PodReconciler) getNodeInCluster(pod *v1.Pod, logger logr.Logger) (*v1.Node, bool) {
+	var currentNode *v1.Node
+	var err error
+	if r.APIReader != nil {
+		currentNode = &v1.Node{}
+		err = r.APIReader.Get(context.Background(), types.NamespacedName{Name: pod.Spec.NodeName}, currentNode)
+	} else {
+		currentNode, err = r.K8sAPI.GetNode(pod.Spec.NodeName)
 	}
-	return true
+	if err != nil {
+		logger.V(1).Info("The requested pod's node has been deleted from the cluster", "PodName", pod.ObjectMeta.Name, "PodNamespace", pod.ObjectMeta.Namespace, "NodeName", pod.Spec.NodeName)
+		return nil, false
+	}
+	return currentNode, true
+}
+
+func cachedNodeMatchesKubernetesNode(cachedNode node.Node, currentNode *v1.Node) bool {
+	if currentNode == nil {
+		return true
+	}
+	cachedInstanceID := cachedNode.GetNodeInstanceID()
+	currentInstanceID := manager.GetNodeInstanceID(currentNode)
+	cachedNodeUID := node.GetNodeUID(cachedNode)
+	instanceMatches := cachedInstanceID == "" || currentInstanceID == "" ||
+		cachedInstanceID == currentInstanceID
+	uidMatches := cachedNodeUID == "" || currentNode.UID == "" || cachedNodeUID == currentNode.UID
+	return instanceMatches && uidMatches
 }
 
 // getAggregateResources computes the aggregate resources across all containers for each resource type
@@ -193,6 +234,7 @@ func getAggregateResources(pod *v1.Pod) map[string]int64 {
 func (r *PodReconciler) SetupWithManager(ctx context.Context, manager ctrl.Manager,
 	clientSet *kubernetes.Clientset, pageLimit int, syncPeriod time.Duration, maxConcurrentReconciles int, healthzHandler *rcHealthz.HealthzHandler) error {
 	r.Log.Info("The pod controller is using MaxConcurrentReconciles", "Routines", maxConcurrentReconciles)
+	r.APIReader = manager.GetAPIReader()
 
 	customChecker, err := custom.NewControllerManagedBy(ctx, manager).
 		WithLogger(r.Log.WithName("custom pod controller")).

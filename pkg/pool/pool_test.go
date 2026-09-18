@@ -394,6 +394,18 @@ func TestPool_ReconcilePool_Create(t *testing.T) {
 	assert.Equal(t, 2, warmPool.pendingCreate)
 }
 
+func TestPool_ReconcilePool_PropagatesProviderGeneration(t *testing.T) {
+	warmPool := getMockPool(poolConfig, map[string]Resource{}, map[string][]Resource{}, 7, false)
+	warmPool.generation = "provider-generation"
+	warmPool.warmPoolConfig.WarmIPTarget = 2
+	warmPool.warmPoolConfig.MinIPTarget = 0
+
+	job := warmPool.ReconcilePool()
+
+	assert.Equal(t, worker.OperationCreate, job.Operations)
+	assert.Equal(t, "provider-generation", job.Generation)
+}
+
 // TestPool_ReconcilePool_Create_LimitByMaxCapacity tests when the warm pool deviates from max deviation and the deviation
 // is greater than the capacity of the pool, then only resources upto the max capacity are created
 func TestPool_ReconcilePool_Create_LimitByMaxCapacity(t *testing.T) {

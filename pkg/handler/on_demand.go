@@ -14,6 +14,7 @@
 package handler
 
 import (
+	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/identity"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/provider"
 	"github.com/aws/amazon-vpc-resource-controller-k8s/pkg/worker"
 
@@ -39,8 +40,21 @@ func NewOnDemandHandler(log logr.Logger, resourceName string,
 }
 
 // HandleCreate provides the resource to the on demand resource by passing the Create Job to the respective Worker
-func (h *onDemandResourceHandler) HandleCreate(requestCount int, pod *v1.Pod) (ctrl.Result, error) {
-	job := worker.NewOnDemandCreateJob(pod.Namespace, pod.Name, requestCount)
+func (h *onDemandResourceHandler) HandleCreate(requestCount int, pod *v1.Pod,
+	allocations ...identity.Allocation,
+) (ctrl.Result, error) {
+	var allocation identity.Allocation
+	if len(allocations) > 0 {
+		allocation = allocations[0]
+	}
+	if allocation.PodUID == "" {
+		allocation.PodUID = pod.UID
+	}
+	if allocation.Name == "" {
+		allocation.Name = pod.Spec.NodeName
+	}
+	job := worker.NewOnDemandCreateJob(
+		pod.Namespace, pod.Name, requestCount, allocation)
 	h.resourceProvider.SubmitAsyncJob(job)
 
 	return ctrl.Result{}, nil
