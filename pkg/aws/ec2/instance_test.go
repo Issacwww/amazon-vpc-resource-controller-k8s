@@ -15,6 +15,7 @@ package ec2
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
 
 	rcv1alpha1 "github.com/aws/amazon-vpc-resource-controller-k8s/apis/vpcresources/v1alpha1"
@@ -148,6 +149,34 @@ func TestEc2Instance_LoadFromNodeNetworkState(t *testing.T) {
 	assert.Equal(t, int32(300), *tcpTimeout)
 	assert.Equal(t, int32(120), *udpStreamTimeout)
 	assert.Equal(t, int32(30), *udpTimeout)
+}
+
+func TestEc2Instance_NodeNetworkStateRoundTrip(t *testing.T) {
+	fullyPopulated := validNodeNetworkState()
+	withoutConnectionTracking := validNodeNetworkState()
+	withoutConnectionTracking.ConnectionTracking = nil
+
+	tests := []struct {
+		name  string
+		state rcv1alpha1.NodeNetworkState
+	}{
+		{
+			name:  "fully populated",
+			state: fullyPopulated,
+		},
+		{
+			name:  "nil connection tracking",
+			state: withoutConnectionTracking,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			instance := getMockInstanceInterface()
+			assert.NoError(t, instance.LoadFromNodeNetworkState(tt.state, "eni-trunk"))
+			assert.True(t, reflect.DeepEqual(tt.state, instance.BuildNodeNetworkState()))
+		})
+	}
 }
 
 func TestEc2Instance_LoadFromNodeNetworkState_CustomNetworking(t *testing.T) {

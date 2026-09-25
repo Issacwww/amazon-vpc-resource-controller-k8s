@@ -207,13 +207,18 @@ func TestBranchENIProvider_InitResourceCheckpointFailureIsBestEffort(t *testing.
 	assert.Equal(t, before+1, checkpointPersistErrorCount(t))
 }
 
-func TestBranchENIProvider_InitResourceRestoredCheckpointSkipsPersistence(t *testing.T) {
+func TestBranchENIProvider_InitResourceRestoredCheckpointPersistsCheckpoint(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
 	instanceID := "i-00000000000000000"
 	subnetID := "subnet-00000000000000000"
 	trunkENIID := "eni-00000000000000000"
+	state := rcv1alpha1.NodeNetworkState{
+		InstanceID:   instanceID,
+		InstanceType: "m5.large",
+		SubnetID:     subnetID,
+	}
 	mockInstance := mock_ec2.NewMockEC2Instance(ctrl)
 	mockEC2API := mock_api.NewMockEC2APIHelper(ctrl)
 	mockK8sAPI := mock_k8s.NewMockK8sWrapper(ctrl)
@@ -236,6 +241,8 @@ func TestBranchENIProvider_InitResourceRestoredCheckpointSkipsPersistence(t *tes
 	mockInstance.EXPECT().SubnetID().Return(subnetID)
 	mockPodAPI.EXPECT().GetRunningPodsOnNode(NodeName).Return(nil, nil)
 	mockEC2API.EXPECT().GetBranchNetworkInterface(&trunkENIID, &subnetID).Return(nil, nil)
+	mockInstance.EXPECT().BuildNodeNetworkState().Return(state)
+	mockK8sAPI.EXPECT().PatchCNINodeCheckpoint(NodeName, state, trunkENIID).Return(nil)
 	mockWorker.EXPECT().SubmitJob(worker.NewOnDemandProcessDeleteQueueJob(NodeName))
 	node := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: NodeName}}
 	mockK8sAPI.EXPECT().GetNode(NodeName).Return(node, nil)
