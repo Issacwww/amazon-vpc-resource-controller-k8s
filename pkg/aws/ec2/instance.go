@@ -181,6 +181,9 @@ func (i *ec2Instance) LoadDetails(ec2APIHelper api.EC2APIHelper) error {
 	deviceIndexes := make([]bool, int(maxInterfaces))
 	for _, nwInterface := range instance.NetworkInterfaces {
 		index := aws.ToInt32(nwInterface.Attachment.DeviceIndex)
+		if index < 0 || index >= int32(len(deviceIndexes)) {
+			return fmt.Errorf("received invalid attachment device index %d for instance type %s; expected index in range [0, %d)", index, source.instanceType, len(deviceIndexes))
+		}
 		deviceIndexes[index] = true
 
 		// Load the Security group of the primary network interface
