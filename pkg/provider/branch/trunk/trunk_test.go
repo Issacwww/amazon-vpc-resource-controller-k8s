@@ -706,8 +706,8 @@ func TestTrunkENI_InitTrunk(t *testing.T) {
 				f.mockEC2APIHelper.EXPECT().CreateAndAttachNetworkInterface(&InstanceId, &SubnetId, SecurityGroups, f.trunkENI.nodeIDTag,
 					&freeIndex, &TrunkEniDescription, &InterfaceTypeTrunk, nil, nil).Return(trunkInterface, nil)
 			},
-			// Pass nil to set the instance to fields.mockInstance in the function later
-			args:    args{instance: nil, podList: []v1.Pod{*MockPod2}},
+			// Pass a different instance to verify the receiver's stored instance is used.
+			args:    args{instance: FakeInstance, podList: []v1.Pod{*MockPod2}},
 			wantErr: false,
 			asserts: func(f *fields) {
 				assert.Equal(t, trunkId, f.trunkENI.TrunkENIID())
@@ -784,6 +784,7 @@ func TestTrunkENI_InitTrunk(t *testing.T) {
 			name: "TrunkExists_WithBranches, verifies no error when trunk exists with branches",
 			prepare: func(f *fields) {
 				f.mockInstance.EXPECT().InstanceID().Return(InstanceId)
+				f.mockInstance.EXPECT().RestoredTrunkENIID().Return("")
 				f.mockInstance.EXPECT().GetCustomNetworkingSpec().Return("", []string{})
 				f.mockEC2APIHelper.EXPECT().GetInstanceNetworkInterface(&InstanceId).Return(instanceNwInterfaces, nil)
 				f.mockEC2APIHelper.EXPECT().WaitForNetworkInterfaceStatusChange(&trunkId, string(awsEc2Types.AttachmentStatusAttached)).Return(nil)
@@ -816,6 +817,7 @@ func TestTrunkENI_InitTrunk(t *testing.T) {
 			name: "TrunkExists_DanglingENIs, verifies ENIs are pushed to delete queue if no pod exists",
 			prepare: func(f *fields) {
 				f.mockInstance.EXPECT().InstanceID().Return(InstanceId)
+				f.mockInstance.EXPECT().RestoredTrunkENIID().Return("")
 				f.mockInstance.EXPECT().GetCustomNetworkingSpec().Return("", []string{})
 				f.mockEC2APIHelper.EXPECT().GetInstanceNetworkInterface(&InstanceId).Return(instanceNwInterfaces, nil)
 				f.mockEC2APIHelper.EXPECT().WaitForNetworkInterfaceStatusChange(&trunkId, string(awsEc2Types.AttachmentStatusAttached)).Return(nil)
@@ -838,6 +840,7 @@ func TestTrunkENI_InitTrunk(t *testing.T) {
 			name: "TrunkExists_NotAttached, verifies error is returned if trunkENI is not attached",
 			prepare: func(f *fields) {
 				f.mockInstance.EXPECT().InstanceID().Return(InstanceId)
+				f.mockInstance.EXPECT().RestoredTrunkENIID().Return("")
 				f.mockEC2APIHelper.EXPECT().GetInstanceNetworkInterface(&InstanceId).Return(instanceNwInterfaces, nil)
 				f.mockEC2APIHelper.EXPECT().WaitForNetworkInterfaceStatusChange(&trunkId, string(awsEc2Types.AttachmentStatusAttached)).Return(MockError)
 			},

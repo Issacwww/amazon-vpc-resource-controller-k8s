@@ -223,12 +223,14 @@ func PrometheusRegister() {
 
 // InitTrunk initializes the trunk network interface and all it's associated branch network interfaces by making calls
 // to EC2 API
+// TODO: remove the unused instance parameter from InitTrunk/TrunkENI; t.instance is set in NewTrunkENI.
+// Left in place to avoid changing the interface, mock, and callers in this change.
 func (t *trunkENI) InitTrunk(instance ec2.EC2Instance, podList []v1.Pod) error {
 	instanceID := t.instance.InstanceID()
 	log := t.log.WithValues("request", "initialize", "instance ID", instanceID)
 
 	var trunk ec2types.InstanceNetworkInterface
-	restoredTrunkENIID := instance.RestoredTrunkENIID()
+	restoredTrunkENIID := t.instance.RestoredTrunkENIID()
 	if restoredTrunkENIID != "" {
 		t.trunkENIId = restoredTrunkENIID
 		log.V(1).Info("restored trunk identity from CNINode checkpoint", "trunk", restoredTrunkENIID)
@@ -260,7 +262,7 @@ func (t *trunkENI) InitTrunk(instance ec2.EC2Instance, podList []v1.Pod) error {
 
 	// Trunk interface doesn't exists, try to create a new trunk interface
 	if t.trunkENIId == "" {
-		freeIndex, err := instance.GetHighestUnusedDeviceIndex()
+		freeIndex, err := t.instance.GetHighestUnusedDeviceIndex()
 		if err != nil {
 			trunkENIOperationsErrCount.WithLabelValues("find_free_index").Inc()
 			log.Error(err, "failed to find free device index")
